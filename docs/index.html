@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Backlinks selbst prüfen und überwachen. Open Source für Docker und Portainer.">
+<title>Backlink-Checker · Docker und Portainer</title>
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+<header><nav><a href="./">Backlink-Checker</a><a href="https://github.com/immobilienmakler/backlink-checker">GitHub ↗</a></nav></header>
+<main>
+<section class="hero">
+<div><p class="meta">Docker · AMD64 und ARM64 · MIT</p>
+<h1>Backlinks prüfen und im Blick behalten.</h1>
+<p>Überprüfe bekannte Quellseiten gegen deine Domain. Verfolge neue und verlorene Backlinks und exportiere deine Prüfergebnisse.</p>
+<a class="button" href="#installation">Installieren</a></div>
+<figure><img src="report.png" alt="Prüfbericht mit gefundenen und verlorenen Backlinks" width="1120" height="760"><figcaption>Prüfbericht mit Beispieldaten</figcaption></figure>
+</section>
+<section id="installation">
+<h2>Installation</h2>
+<p>Mit Docker und Git kannst du die App direkt aus GitHub bauen und starten.</p>
+<pre><code>git clone https://github.com/immobilienmakler/backlink-checker.git &amp;&amp; cd backlink-checker &amp;&amp; docker compose up -d --build</code></pre>
+<p>Öffne danach <a href="http://localhost:8080">localhost:8080</a>. Für Portainer verwende den Pfad <code>portainer.yaml</code> im Stack aus dem Git-Repository. Das Registry-Image ist für AMD64 und ARM64 vorgesehen.</p>
+<a href="https://github.com/immobilienmakler/backlink-checker#readme">Ausführliche Anleitung auf GitHub ↗</a>
+</section>
+<section>
+<h2>Dein erster Prüflauf</h2>
+<ol><li>Trage die Zieldomain oder eine exakte Ziel-URL ein.</li><li>Füge bekannte Quellseiten ein, eine URL pro Zeile.</li><li>Wähle das Prüfintervall und starte die Prüfung. Den Bericht kannst du als CSV oder JSON exportieren.</li></ol>
+<figure><img src="check.png" alt="Eingabemaske mit Zieldomain, Prüfintervall und Quellseiten" width="1120" height="760"><figcaption>Prüfauftrag mit Beispieldaten</figcaption></figure>
+<p>Die App prüft vorhandene Quellenlisten im ausgelieferten HTML. Für die Recherche nach unbekannten Backlinks kannst du eine Liste aus einem Backlink-Index verwenden.</p>
+</section>
+</main>
+</body>
+</html>

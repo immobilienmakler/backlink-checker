@@ -1,0 +1,19 @@
+:root { color-scheme: light; font: 17px/1.65 system-ui, sans-serif; color: #142e28; background: #f2f7f3; }
+* { box-sizing: border-box; }
+body { margin: 0; }
+header { background: #143a33; color: white; }
+nav, main { max-width: 1220px; margin: auto; padding: 1rem clamp(1rem, 4vw, 3rem); }
+nav { display: flex; justify-content: space-between; }
+nav a { color: white; text-decoration: none; font-weight: 700; }
+section { padding: 2.5rem 0; border-bottom: 1px solid #cfded8; }
+.hero { display: grid; grid-template-columns: 1fr 1.3fr; gap: 2rem; align-items: center; }
+h1 { font-size: clamp(2.5rem, 6vw, 4.6rem); line-height: 1; letter-spacing: -.06em; margin: .25em 0; }
+h2 { font-size: 2rem; margin: 0; letter-spacing: -.04em; }
+a { color: #17594a; }
+.meta, figcaption { color: #48655f; }
+.button { display: inline-block; background: #17594a; color: white; font-weight: 700; padding: .6rem 1rem; border-radius: .5rem; text-decoration: none; }
+figure { margin: 0; max-width: 54rem; }
+img { display: block; width: 100%; height: auto; border: 1px solid #cfded8; border-radius: .75rem; }
+figcaption { font-size: .85rem; margin-top: .4rem; }
+pre { overflow: auto; padding: 1rem; background: #143a33; color: white; border-radius: .6rem; }
+@media (max-width: 760px) { .hero { grid-template-columns: 1fr; } }
