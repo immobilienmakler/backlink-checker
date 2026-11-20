@@ -98,3 +98,11 @@ python3 app.py
 ## Projektwebsite veröffentlichen
 
 Der Inhalt der [Projektwebsite](https://immobilienmakler.github.io/backlink-checker/) liegt unter [docs/](docs/). Wähle in den [Pages-Einstellungen](https://github.com/immobilienmakler/backlink-checker/settings/pages) unter **Build and deployment → Source** die Option **GitHub Actions**. Starte bei Bedarf den Workflow [GitHub Pages](https://github.com/immobilienmakler/backlink-checker/actions/workflows/pages.yml) über **Run workflow**. Der Workflow **Screenshots** rendert Startseite und Bericht aus der echten App mit Beispieldaten.
+
+## Mehrere Domains verwalten
+
+Die Startseite gruppiert Prüfaufträge nach Ziel-Hostname. `www.beispiel.de` und `beispiel.de` erscheinen zusammen. Andere Subdomains erhalten einen eigenen Eintrag, wenn du sie ausdrücklich als Ziel erfasst. Der Domain-Abgleich eines Auftrags berücksichtigt weiterhin die Subdomains seines jeweiligen Ziels.
+
+Öffne eine Domain, um ihre Aufträge, Zeitpläne und jeweils letzten abgeschlossenen Ergebnisse zu sehen. **Alle Aufträge dieser Domain prüfen** plant ausschließlich die Aufträge dieser Domain ein. Die Übersicht summiert die letzten abgeschlossenen Ergebnisse pro Auftrag. Eine Quellseite, die in mehreren Aufträgen vorkommt, wird entsprechend mehrfach gezählt.
+
+Beim Upgrade mit demselben Container-Volume erscheinen vorhandene Aufträge automatisch in der neuen Übersicht. In Portainer aktualisierst du den bestehenden Stack mit erneutem Image-Pull.

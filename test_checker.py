@@ -1,7 +1,9 @@
+import io
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 import app
 from checker import inspect, normalize, public_address
@@ -48,3 +50,47 @@ class CheckerTests(unittest.TestCase):
     def test_csv_escaping(self):
         self.assertEqual(app.safe_csv(" =1"), "' =1")
         self.assertEqual(app.safe_csv("normal"), "normal")
+
+    def test_domain_overview_and_batch_are_scoped_to_existing_jobs(self):
+        class Request:
+            def __init__(self, wire):
+                self.input = io.BytesIO(wire)
+                self.output = bytearray()
+
+            def makefile(self, *_):
+                return self.input
+
+            def sendall(self, data):
+                self.output.extend(data)
+
+        def request(method, path, form=None):
+            body = urlencode(form or {}).encode()
+            connection = Request(
+                f"{method} {path} HTTP/1.0\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
+            )
+            app.Handler(connection, ("127.0.0.1", 1234), None)
+            return bytes(connection.output).decode()
+
+        with tempfile.TemporaryDirectory() as directory, patch.multiple(
+            app, DB=Path(directory) / "test.db", PASSWORD=""
+        ):
+            app.initialize()
+            with app.connect() as db:
+                db.executemany("INSERT INTO jobs VALUES (?, ?, 0, '[]', 0, NULL, 'now')", [
+                    (1, "https://www.ziel.de/seite"),
+                    (2, "https://ziel.de/"),
+                    (3, "https://andere.de/"),
+                    (4, "https://blog.ziel.de/"),
+                ])
+                db.executemany("INSERT INTO runs VALUES (?, 1, 'now', ?)", [(1, "done"), (2, None)])
+                db.execute("INSERT INTO results VALUES (1,'source','source',200,'gefunden','','[]')")
+                db.execute("INSERT INTO results VALUES (2,'source','source',200,'fehlt','','[]')")
+                self.assertEqual(app.domain_jobs(db)["ziel.de"][1][7:], (1, 1, 0, 0))
+            self.assertIn('/domains/andere.de', request("GET", "/"))
+            detail = request("GET", "/domains/ziel.de")
+            self.assertIn('/jobs/2', detail)
+            self.assertNotIn('/jobs/3', detail)
+            self.assertIn("403", request("POST", "/domains/ziel.de", {"csrf": "invalid"}))
+            self.assertIn("Location: /domains/ziel.de", request("POST", "/domains/ziel.de", {"csrf": app.TOKEN}))
+            with app.connect() as db:
+                self.assertEqual(db.execute("SELECT id FROM jobs WHERE next_run IS NOT NULL").fetchall(), [(2,)])

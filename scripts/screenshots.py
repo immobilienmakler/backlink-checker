@@ -28,6 +28,7 @@ def seed(directory):
     app.initialize()
     with app.connect() as db:
         db.execute("INSERT INTO jobs VALUES (1,'https://beispiel.de/',0,'[]',0,NULL,'2026-11-21')")
+        db.execute("INSERT INTO jobs VALUES (2,'https://zweites-projekt.example/',0,'[]',24,NULL,'2026-11-21')")
         for run, date in [(1, "2026-11-20"), (2, "2026-11-21")]:
             db.execute("INSERT INTO runs VALUES (?,1,?,?)",
                        (run, date + " 09:00:00 UTC", date + " 09:00:04 UTC"))
@@ -60,6 +61,7 @@ def capture():
         browser = pw.chromium.launch()
         page = browser.new_page(viewport={"width": 1120, "height": 760})
         page.goto(URL)
+        page.get_by_role("heading", name="Domain-Übersicht").wait_for()
         page.get_by_label("Zieldomain oder Ziel-URL").fill("https://beispiel.de/")
         page.get_by_label("Wiederholung").select_option("24")
         page.get_by_label("Quellseiten").fill("\n".join(SOURCES))

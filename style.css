@@ -28,3 +28,7 @@ th,td{padding:.8rem;text-align:left;vertical-align:top;border-bottom:1px solid v
 th:nth-child(2){width:22%}
 td ul{list-style:none;padding:0;margin:0}
 td li+li{margin-top:.5rem}
+.domain-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,290px),1fr));gap:1rem;list-style:none;padding:0}
+.domain-grid li{background:white;border:1px solid var(--line);border-radius:14px;padding:1.25rem;overflow-wrap:anywhere}
+.domain-grid a{font-size:1.25rem;font-weight:750}
+.domain-grid span{display:block;margin-top:.5rem}

@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from checker import inspect, normalize
 
@@ -59,11 +59,12 @@ def now():
 
 def execute_next():
     with closing(connect()) as db, db:
-        job = db.execute("""SELECT id,target,exact,sources,interval_hours FROM jobs
+        db.execute("BEGIN IMMEDIATE")
+        job = db.execute("""SELECT id,target,exact,sources FROM jobs
                             WHERE next_run <= unixepoch() ORDER BY next_run,id LIMIT 1""").fetchone()
         if job is None:
             return False
-        job_id, target, exact, sources, interval = job
+        job_id, target, exact, sources = job
         run_id = db.execute("INSERT INTO runs(job_id,started) VALUES (?,?)", (job_id, now())).lastrowid
         db.execute("UPDATE jobs SET next_run=NULL WHERE id=?", (job_id,))
     for source in json.loads(sources):
@@ -73,9 +74,8 @@ def execute_next():
                        (run_id, source, final, http, status, detail, json.dumps(links, ensure_ascii=False)))
     with closing(connect()) as db, db:
         db.execute("UPDATE runs SET finished=? WHERE id=?", (now(), run_id))
-        if interval:
-            db.execute("""UPDATE jobs SET next_run=COALESCE(next_run,unixepoch()+?)
-                          WHERE id=?""", (interval * 3600, job_id))
+        db.execute("""UPDATE jobs SET next_run=COALESCE(next_run,unixepoch()+interval_hours*3600)
+                      WHERE id=? AND interval_hours>0""", (job_id,))
     return True
 
 
@@ -94,6 +94,40 @@ def clean_form(form):
     if not 1 <= len(sources) <= MAX_SOURCES or interval not in {0, 1, 24, 168}:
         raise ValueError("Bitte 1 bis 250 Quell-URLs und ein gültiges Prüfintervall angeben.")
     return target, int(form.get("match") == ["exact"]), json.dumps(sources), interval
+
+
+def domain_key(target):
+    return urlsplit(target).hostname.removeprefix("www.")
+
+
+def domain_path(domain):
+    return "/domains/" + quote(domain, safe="")
+
+
+def domain_jobs(db):
+    domains = {}
+    rows = db.execute("""
+        WITH latest AS (
+          SELECT job_id, MAX(id) AS run_id FROM runs WHERE finished IS NOT NULL GROUP BY job_id
+        )
+        SELECT j.id,j.target,j.exact,j.interval_hours,j.next_run,r.id,r.finished,
+          COUNT(s.source),
+          COUNT(CASE WHEN s.status='gefunden' THEN 1 END),
+          COUNT(CASE WHEN s.status='fehlt' THEN 1 END),
+          COUNT(CASE WHEN s.status='nicht prüfbar' THEN 1 END)
+        FROM jobs j LEFT JOIN latest l ON j.id=l.job_id
+        LEFT JOIN runs r ON r.id=l.run_id LEFT JOIN results s ON s.run_id=r.id
+        GROUP BY j.id ORDER BY j.id DESC
+    """)
+    for row in rows:
+        domains.setdefault(domain_key(row[1]), []).append(row)
+    return domains
+
+
+def queue_jobs(db, job_ids):
+    db.executemany("""UPDATE jobs SET next_run=unixepoch() WHERE id=? AND NOT EXISTS
+                     (SELECT 1 FROM runs WHERE job_id=jobs.id AND finished IS NULL)""",
+                   [(job_id,) for job_id in job_ids])
 
 
 def safe_csv(value):
@@ -171,7 +205,9 @@ class Handler(BaseHTTPRequestHandler):
             self.dashboard()
         else:
             parts = path.strip("/").split("/")
-            if len(parts) == 2 and parts[0] == "jobs" and parts[1].isascii() and parts[1].isdigit() and len(parts[1]) < 19:
+            if len(parts) == 2 and parts[0] == "domains":
+                self.domain(unquote(parts[1]))
+            elif len(parts) == 2 and parts[0] == "jobs" and parts[1].isascii() and parts[1].isdigit() and len(parts[1]) < 19:
                 self.job(int(parts[1]))
             elif len(parts) == 3 and parts[0] == "runs" and parts[1].isascii() and parts[1].isdigit() and len(parts[1]) < 19:
                 self.run_report(int(parts[1]), parts[2])
@@ -180,12 +216,44 @@ class Handler(BaseHTTPRequestHandler):
 
     def dashboard(self):
         with closing(connect()) as db:
-            jobs = db.execute("SELECT id,target,created FROM jobs ORDER BY id DESC").fetchall()
-        rows = "".join(f'<li><a href="/jobs/{i}">{escape(target)}</a><small>{created}</small></li>'
-                       for i, target, created in jobs)
-        self.send_body(page("Backlinks prüfen", "<p>Überprüfe bekannte Quellseiten und verfolge ihre Links im Zeitverlauf.</p>"
-                            + create_form() + "<h2>Prüfaufträge</h2>"
-                            + (f'<ul class="entries">{rows}</ul>' if rows else "<p>Noch keine Prüfaufträge.</p>")))
+            domains = domain_jobs(db)
+        cards = []
+        for domain, jobs in sorted(domains.items()):
+            found, missing, unavailable = (sum(job[i] for job in jobs) for i in (8, 9, 10))
+            last = max((job[6] or "" for job in jobs), default="")
+            counts = f"{found} gefunden · {missing} fehlen · {unavailable} nicht prüfbar"
+            label = f"{len(jobs)} Prüfaufträge"
+            if last:
+                label += f" · Letzter Abschluss {last}"
+            cards.append(f'<li><a href="{domain_path(domain)}">{escape(domain)}</a>'
+                         f'<small>{label}</small><span>{counts if last else "Noch kein abgeschlossener Lauf"}</span></li>')
+        overview = f'<ul class="domain-grid">{"".join(cards)}</ul>' if cards else "<p>Noch keine Domains eingerichtet.</p>"
+        self.send_body(page("Domain-Übersicht", overview + "<h2>Backlinks prüfen</h2>"
+                            "<p>Überprüfe bekannte Quellseiten und verfolge ihre Links im Zeitverlauf.</p>"
+                            + create_form()))
+
+    def domain(self, domain):
+        with closing(connect()) as db:
+            jobs = domain_jobs(db).get(domain)
+        if not jobs:
+            self.send_body(page("Domain nicht gefunden", '<a href="/">Zur Domain-Übersicht</a>'), 404)
+            return
+        rows = []
+        for job_id, target, exact, interval, scheduled, run_id, finished, total, found, missing, unavailable in jobs:
+            schedule = f"Alle {interval} h" if interval else "Manuell"
+            if scheduled is not None:
+                schedule += " · nächste Prüfung " + datetime.fromtimestamp(scheduled, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            outcome = f'{found}/{total} gefunden · {missing} fehlen · {unavailable} nicht prüfbar'
+            report = f'<a href="/runs/{run_id}/report">{finished}</a><small>{outcome}</small>' if run_id else "Noch kein abgeschlossener Lauf"
+            rows.append(f'<tr><td><a href="/jobs/{job_id}">{escape(target)}</a>'
+                        f'<small>{"Exakte URL" if exact else "Domain-Abgleich"}</small></td><td>{schedule}</td>'
+                        f'<td>{report}</td></tr>')
+        self.send_body(page(domain, f"""<p><a href="/">Zur Domain-Übersicht</a></p>
+        <form class="actions" method="post" action="{domain_path(domain)}">
+        <input type="hidden" name="csrf" value="{TOKEN}"><button>Alle Aufträge dieser Domain prüfen</button></form>
+        <h2>Prüfaufträge</h2><div class="scroll"><table><thead><tr><th>Ziel</th><th>Zeitplan</th>
+        <th>Letzter Abschluss</th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>
+        <h2>Neuer Prüfauftrag</h2>{create_form(jobs[0][1] if ":" in domain else "https://" + domain + "/")}"""))
 
     def job(self, job_id):
         with closing(connect()) as db:
@@ -207,7 +275,8 @@ class Handler(BaseHTTPRequestHandler):
                        for i, started, finished, found, total in runs)
         schedule = datetime.fromtimestamp(job[2], timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if job[2] else ""
         suffix = f" · Nächste Prüfung {schedule}" if schedule else ""
-        self.send_body(page(job[0], f"""<p>{"Intervall " + str(job[1]) + " h" if job[1] else "Manuelle Prüfung"}{suffix}</p>
+        self.send_body(page(job[0], f"""<p><a href="{domain_path(domain_key(job[0]))}">Zur Domain</a></p>
+        <p>{"Intervall " + str(job[1]) + " h" if job[1] else "Manuelle Prüfung"}{suffix}</p>
         <form class="actions" method="post" action="/jobs/{job_id}">
         <input type="hidden" name="csrf" value="{TOKEN}">{controls}</form>
         <h2>Verlauf</h2><ul class="entries">{rows or "<li>Prüfung wartet auf Ausführung.</li>"}</ul>"""))
@@ -260,6 +329,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.authorized():
             return
+        form = {}
+        location = ""
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 1_600_000:
@@ -273,12 +344,19 @@ class Handler(BaseHTTPRequestHandler):
                 if path == ["jobs"]:
                     job_id = db.execute("""INSERT INTO jobs(target,exact,sources,interval_hours,next_run,created)
                                         VALUES (?,?,?,?,unixepoch(),?)""", (*clean_form(form), now())).lastrowid
+                elif len(path) == 2 and path[0] == "domains":
+                    domain = unquote(path[1])
+                    jobs = domain_jobs(db).get(domain)
+                    if not jobs:
+                        self.send_body(page("Domain nicht gefunden", '<a href="/">Zur Domain-Übersicht</a>'), 404)
+                        return
+                    queue_jobs(db, [job[0] for job in jobs])
+                    location = domain_path(domain)
                 elif len(path) == 2 and path[0] == "jobs" and path[1].isascii() and path[1].isdigit() and len(path[1]) < 19:
                     job_id = int(path[1])
                     action = form.get("action", [""])[0]
                     if action == "run":
-                        db.execute("""UPDATE jobs SET next_run=unixepoch() WHERE id=? AND NOT EXISTS
-                                    (SELECT 1 FROM runs WHERE job_id=? AND finished IS NULL)""", (job_id, job_id))
+                        queue_jobs(db, [job_id])
                     elif action == "stop":
                         db.execute("UPDATE jobs SET interval_hours=0,next_run=NULL WHERE id=?", (job_id,))
                     else:
@@ -287,12 +365,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_body(page("Seite nicht gefunden", ""), 404)
                     return
         except (ValueError, UnicodeError) as exc:
-            form = locals().get("form", {})
             self.send_body(page("Eingabe prüfen", f'<p role="alert">{escape(str(exc))}</p>' + create_form(
                 form.get("target", [""])[0], form.get("sources", [""])[0], form.get("interval", ["0"])[0],
                 form.get("match") == ["exact"])), 400)
             return
-        self.send_body("", 303, headers=[("Location", f"/jobs/{job_id}")])
+        self.send_body("", 303, headers=[("Location", location or f"/jobs/{job_id}")])
 
 
 if __name__ == "__main__":
