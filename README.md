@@ -106,3 +106,9 @@ Die Startseite gruppiert Prüfaufträge nach Ziel-Hostname. `www.beispiel.de` un
 Öffne eine Domain, um ihre Aufträge, Zeitpläne und jeweils letzten abgeschlossenen Ergebnisse zu sehen. **Alle Aufträge dieser Domain prüfen** plant ausschließlich die Aufträge dieser Domain ein. Die Übersicht summiert die letzten abgeschlossenen Ergebnisse pro Auftrag. Eine Quellseite, die in mehreren Aufträgen vorkommt, wird entsprechend mehrfach gezählt.
 
 Beim Upgrade mit demselben Container-Volume erscheinen vorhandene Aufträge automatisch in der neuen Übersicht. In Portainer aktualisierst du den bestehenden Stack mit erneutem Image-Pull.
+
+### Dashboard
+
+Das Dashboard zeigt die Zahl der Domains und Prüfaufträge, geprüfte Quellen mit gefundenen oder fehlenden Backlinks sowie Abruffehler. Die Domain-Tabelle enthält außerdem hinzugekommene und verlorene Links, den letzten abgeschlossenen Bericht und den nächsten Prüftermin. Du kannst nach Domain suchen oder gezielt fehlende, verlorene und nicht prüfbare Backlinks filtern.
+
+Der Vergleich verwendet pro Auftrag die letzten zwei abgeschlossenen Läufe. Eine Quelle zählt als hinzugekommen oder verloren, wenn sie zwischen **fehlt** und **gefunden** wechselt. Abruffehler bleiben separat sichtbar.

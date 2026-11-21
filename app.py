@@ -7,6 +7,7 @@ import os
 import secrets
 import sqlite3
 import threading
+from collections import namedtuple
 from contextlib import closing
 from datetime import datetime, timezone
 from html import escape
@@ -44,7 +45,7 @@ def initialize():
           run_id INTEGER NOT NULL, source TEXT NOT NULL, final TEXT NOT NULL,
           http INTEGER, status TEXT NOT NULL, detail TEXT NOT NULL, links TEXT NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS result_run ON results(run_id);
+        CREATE INDEX IF NOT EXISTS result_run_source ON results(run_id,source);
         CREATE INDEX IF NOT EXISTS run_job ON runs(job_id);
         """)
         db.execute("""UPDATE jobs SET next_run=unixepoch() WHERE id IN
@@ -104,24 +105,75 @@ def domain_path(domain):
     return "/domains/" + quote(domain, safe="")
 
 
+DomainJob = namedtuple("DomainJob", "id target exact interval scheduled run finished total found missing unavailable gained lost active")
+
+
 def domain_jobs(db):
     domains = {}
     rows = db.execute("""
         WITH latest AS (
           SELECT job_id, MAX(id) AS run_id FROM runs WHERE finished IS NOT NULL GROUP BY job_id
+        ), comparison AS (
+          SELECT l.job_id, MAX(p.id) AS previous FROM latest l
+          JOIN runs p ON p.job_id=l.job_id AND p.id<l.run_id AND p.finished IS NOT NULL
+          GROUP BY l.job_id
         )
         SELECT j.id,j.target,j.exact,j.interval_hours,j.next_run,r.id,r.finished,
           COUNT(s.source),
           COUNT(CASE WHEN s.status='gefunden' THEN 1 END),
           COUNT(CASE WHEN s.status='fehlt' THEN 1 END),
-          COUNT(CASE WHEN s.status='nicht prüfbar' THEN 1 END)
+          COUNT(CASE WHEN s.status='nicht prüfbar' THEN 1 END),
+          COUNT(CASE WHEN s.status='gefunden' AND old.status='fehlt' THEN 1 END),
+          COUNT(CASE WHEN s.status='fehlt' AND old.status='gefunden' THEN 1 END),
+          (SELECT MAX(id) FROM runs WHERE job_id=j.id AND finished IS NULL)
         FROM jobs j LEFT JOIN latest l ON j.id=l.job_id
+        LEFT JOIN comparison c ON c.job_id=j.id
         LEFT JOIN runs r ON r.id=l.run_id LEFT JOIN results s ON s.run_id=r.id
+        LEFT JOIN results old ON old.run_id=c.previous AND old.source=s.source
         GROUP BY j.id ORDER BY j.id DESC
     """)
     for row in rows:
-        domains.setdefault(domain_key(row[1]), []).append(row)
+        job = DomainJob(*row)
+        domains.setdefault(domain_key(job.target), []).append(job)
     return domains
+
+
+def schedule_time(timestamp):
+    return datetime.fromtimestamp(timestamp, timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+
+
+def domain_summary(jobs, timestamp):
+    latest = max((job for job in jobs if job.finished), key=lambda job: (job.finished, job.run), default=None)
+    scheduled = [job.scheduled for job in jobs if job.scheduled is not None]
+    return {
+        "latest": latest,
+        "next": min(scheduled, default=None),
+        "running": sum(job.active is not None for job in jobs),
+        "queued": sum(value <= timestamp for value in scheduled),
+        "jobs": len(jobs),
+        **{field: sum(getattr(job, field) for job in jobs)
+           for field in ("total", "found", "missing", "unavailable", "gained", "lost")},
+    }
+
+
+def dashboard_domain_row(domain, data):
+    latest = data["latest"]
+    last = f'<a href="/runs/{latest.run}/report">{escape(latest.finished)}</a>' if latest else "Noch offen"
+    activity = []
+    if data["running"]:
+        activity.append(f'{data["running"]} aktiv')
+    if data["queued"]:
+        activity.append(f'{data["queued"]} in Warteschlange')
+    if data["next"] is not None and not data["queued"]:
+        activity.append(schedule_time(data["next"]))
+    if not activity:
+        activity.append("Keine geplant")
+    return f"""<tr><th scope="row"><a href="{domain_path(domain)}">{escape(domain)}</a>
+    <small>{data["jobs"]} Aufträge</small></th>
+    <td><strong>{data["found"]}</strong><small>{data["total"]} geprüft</small></td>
+    <td>{data["missing"]}</td><td>{data["unavailable"]}</td>
+    <td><span class="gain">+{data["gained"]}</span> <span class="loss">−{data["lost"]}</span></td>
+    <td>{last}</td><td>{'<br>'.join(activity)}</td></tr>"""
 
 
 def queue_jobs(db, job_ids):
@@ -193,7 +245,8 @@ class Handler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self):
-        path = urlsplit(self.path).path
+        url = urlsplit(self.path)
+        path = url.path
         if path == "/health":
             self.send_body("ok", mime="text/plain")
             return
@@ -202,7 +255,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/style.css":
             self.send_body(Path(__file__).with_name("style.css").read_text(), mime="text/css; charset=utf-8")
         elif path == "/":
-            self.dashboard()
+            self.dashboard(url.query)
         else:
             parts = path.strip("/").split("/")
             if len(parts) == 2 and parts[0] == "domains":
@@ -214,23 +267,69 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_body(page("Seite nicht gefunden", ""), 404)
 
-    def dashboard(self):
-        with closing(connect()) as db:
-            domains = domain_jobs(db)
-        cards = []
-        for domain, jobs in sorted(domains.items()):
-            found, missing, unavailable = (sum(job[i] for job in jobs) for i in (8, 9, 10))
-            last = max((job[6] or "" for job in jobs), default="")
-            counts = f"{found} gefunden · {missing} fehlen · {unavailable} nicht prüfbar"
-            label = f"{len(jobs)} Prüfaufträge"
-            if last:
-                label += f" · Letzter Abschluss {last}"
-            cards.append(f'<li><a href="{domain_path(domain)}">{escape(domain)}</a>'
-                         f'<small>{label}</small><span>{counts if last else "Noch kein abgeschlossener Lauf"}</span></li>')
-        overview = f'<ul class="domain-grid">{"".join(cards)}</ul>' if cards else "<p>Noch keine Domains eingerichtet.</p>"
-        self.send_body(page("Domain-Übersicht", overview + "<h2>Backlinks prüfen</h2>"
-                            "<p>Überprüfe bekannte Quellseiten und verfolge ihre Links im Zeitverlauf.</p>"
-                            + create_form()))
+    def dashboard(self, query):
+        try:
+            params = parse_qs(query, max_num_fields=10)
+        except ValueError:
+            params = {}
+        search = params.get("q", [""])[0][:254].strip()
+        status = params.get("status", ["all"])[0]
+        with closing(connect()) as db, db:
+            db.execute("BEGIN")
+            timestamp = db.execute("SELECT unixepoch()").fetchone()[0]
+            domains = {name: domain_summary(jobs, timestamp) for name, jobs in domain_jobs(db).items()}
+            recent = db.execute("""SELECT r.id,j.target,r.finished FROM runs r
+                               JOIN jobs j ON j.id=r.job_id WHERE r.finished IS NOT NULL
+                               ORDER BY r.finished DESC,r.id DESC LIMIT 5""").fetchall()
+        totals = {key: sum(data[key] for data in domains.values())
+                  for key in ("jobs", "total", "found", "missing", "unavailable", "gained", "lost", "running", "queued")}
+        metrics = (
+            (str(len(domains)), "Domains", f'{totals["jobs"]} Prüfaufträge'),
+            (str(totals["found"]), "Quellen mit Backlink", f'{totals["total"]} geprüfte Quellen'),
+            (str(totals["missing"]), "Backlink fehlt", f'{totals["unavailable"]} nicht prüfbar'),
+            (f'+{totals["gained"]} / −{totals["lost"]}', "Hinzugekommen / verloren", "Gegenüber dem vorherigen Lauf"),
+        )
+        cards = "".join(f'<li><span>{label}</span><strong>{value}</strong><small>{note}</small></li>'
+                        for value, label, note in metrics)
+        filters = (
+            ("all", "Alle Domains"), ("missing", "Backlink fehlt"), ("unavailable", "Nicht prüfbar"),
+            ("lost", "Backlinks verloren"), ("unverified", "Noch ohne Ergebnis"),
+        )
+        if status not in dict(filters):
+            status = "all"
+        options = "".join(f'<option value="{value}" {"selected" if value == status else ""}>{label}</option>'
+                          for value, label in filters)
+        rows = []
+        for name, data in sorted(domains.items()):
+            match = {
+                "all": True, "missing": data["missing"] > 0, "unavailable": data["unavailable"] > 0,
+                "lost": data["lost"] > 0, "unverified": data["latest"] is None,
+            }
+            if search.casefold() in name.casefold() and match[status]:
+                rows.append(dashboard_domain_row(name, data))
+        table = f"""<div class="scroll overview"><table><thead><tr>
+        <th scope="col">Domain</th><th scope="col">Gefunden</th><th scope="col">Fehlt</th>
+        <th scope="col">Nicht prüfbar</th><th scope="col">Neu / verloren</th>
+        <th scope="col">Letzter Abschluss</th><th scope="col">Nächste Prüfung</th>
+        </tr></thead><tbody>{''.join(rows)}</tbody></table></div>"""
+        empty = "Keine Domain entspricht dem Filter." if domains else "Lege den ersten Prüfauftrag an, um eine Domain hinzuzufügen."
+        activity = "".join(f'<li><a href="/runs/{run}/report">{escape(target)}</a>'
+                           f'<small>{escape(finished)}</small></li>' for run, target, finished in recent)
+        self.send_body(page("Backlink-Dashboard", f"""
+        <div class="dashboard-intro"><p>Prüfergebnisse und Zeitpläne für deine Domains.</p>
+        <a class="primary-link" href="#neuer-auftrag">Neuer Prüfauftrag</a></div>
+        <ul class="metrics">{cards}</ul>
+        <section aria-labelledby="domains-title"><h2 id="domains-title">Domains</h2>
+        <p>{totals["running"]} aktive Prüfungen · {totals["queued"]} in Warteschlange</p>
+        <form method="get" action="/" class="filters">
+        <label>Domain suchen<input type="search" name="q" value="{escape(search)}"></label>
+        <label>Status<select name="status">{options}</select></label><button>Filtern</button></form>
+        {table if rows else f'<p class="empty">{empty}</p>'}
+        <p class="caption">Die Zahlen stammen aus dem letzten abgeschlossenen Lauf jedes Auftrags.
+        Dieselbe Quelle kann in mehreren Aufträgen gezählt werden.</p></section>
+        <section aria-labelledby="recent-title"><h2 id="recent-title">Letzte Prüfläufe</h2>
+        {f'<ul class="entries">{activity}</ul>' if activity else '<p>Noch keine Prüfläufe abgeschlossen.</p>'}</section>
+        <section id="neuer-auftrag"><h2>Neuer Prüfauftrag</h2>{create_form()}</section>"""))
 
     def domain(self, domain):
         with closing(connect()) as db:
@@ -239,10 +338,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_body(page("Domain nicht gefunden", '<a href="/">Zur Domain-Übersicht</a>'), 404)
             return
         rows = []
-        for job_id, target, exact, interval, scheduled, run_id, finished, total, found, missing, unavailable in jobs:
+        for job in jobs:
+            job_id, target, exact, interval, scheduled, run_id, finished, total, found, missing, unavailable, _, _, active = job
             schedule = f"Alle {interval} h" if interval else "Manuell"
-            if scheduled is not None:
-                schedule += " · nächste Prüfung " + datetime.fromtimestamp(scheduled, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            if active is not None:
+                schedule += f' · <a href="/runs/{active}/report">Läuft</a>'
+            elif scheduled is not None:
+                schedule += " · nächste Prüfung " + schedule_time(scheduled)
             outcome = f'{found}/{total} gefunden · {missing} fehlen · {unavailable} nicht prüfbar'
             report = f'<a href="/runs/{run_id}/report">{finished}</a><small>{outcome}</small>' if run_id else "Noch kein abgeschlossener Lauf"
             rows.append(f'<tr><td><a href="/jobs/{job_id}">{escape(target)}</a>'
