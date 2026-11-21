@@ -1,4 +1,5 @@
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -98,6 +99,11 @@ class CheckerTests(unittest.TestCase):
             self.assertIn("Quelle", request("GET", "/runs/2/report"))
             self.assertIn("\"status\": \"gefunden\"", request("GET", "/runs/2/json"))
             self.assertIn("quelle;effektive_quelle", request("GET", "/runs/2/csv"))
+            self.assertIn("Hinzugekommen", request("GET", "/runs/2/changes?change=new"))
+            self.assertIn("Keine Ergebnisse für diese Auswahl", request("GET", "/runs/2/report?change=lost"))
+            self.assertIn("Quellen verwalten", request("GET", "/jobs/2/sources"))
+            response = request("POST", "/jobs/2", {"action": "append", "sources": "quelle.example", "csrf": app.TOKEN})
+            self.assertIn("Location: /jobs/2/sources?updated=", response)
             detail = request("GET", "/domains/ziel.de")
             self.assertIn('/jobs/2', detail)
             self.assertNotIn('/jobs/3', detail)
@@ -150,3 +156,51 @@ class CheckerTests(unittest.TestCase):
         self.assertEqual(json.loads(app.clean_form(form)[2]), ["https://quelle.example/", "https://other.example/"])
         with patch.object(app, "MAX_SOURCES", 1), self.assertRaisesRegex(ValueError, "Maximal"):
             app.clean_form(form)
+
+    def test_targeted_retry_keeps_healthy_results_and_detects_link_edits(self):
+        sources = [f"https://quelle.example/{i}" for i in range(5)]
+        stable = {"url": "https://ziel.de/", "anchor": "Alt", "rel": ""}
+        edited = dict(stable, anchor="Neu")
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, "DB", Path(directory) / "test.db"):
+            app.initialize()
+            with app.connect() as db:
+                db.execute("INSERT INTO jobs VALUES (1,'https://ziel.de/',0,?,24,unixepoch()+3600,'now')",
+                           (json.dumps(sources[:4]),))
+                db.executemany("INSERT INTO runs VALUES (?,1,'now','done')", [(1,), (2,)])
+                for run, source, status, links in [
+                    (1, sources[0], "gefunden", [stable]), (2, sources[0], "fehlt", []),
+                    (2, sources[1], "gefunden", [stable]), (2, sources[2], "nicht prüfbar", []),
+                    (2, sources[3], "gefunden", [stable]),
+                ]:
+                    db.execute("INSERT INTO results VALUES (?,?,?,?,?,?,?)",
+                               (run, source, source, 200, status, "", json.dumps(links)))
+                removed = app.update_sources(db, 1, sources[:4], {"source": [sources[3]]}, "remove")
+                self.assertIn("1 Quelle", removed)
+                current = json.loads(db.execute("SELECT sources FROM jobs").fetchone()[0])
+                app.update_sources(db, 1, current, {"sources": ["\n".join([sources[1], sources[4]])]}, "append")
+                db.execute("INSERT INTO retries VALUES (1,'attention')")
+                schedule = db.execute("SELECT next_run FROM jobs").fetchone()[0]
+
+            checked = set()
+
+            def inspect(source, *_):
+                checked.add(source)
+                return source, 200, "gefunden", "", [edited]
+
+            with patch.object(app, "inspect", new=inspect):
+                self.assertTrue(app.execute_next())
+            self.assertEqual(checked, {sources[0], sources[2], sources[4]})
+            with app.connect() as db:
+                db.create_function("link_signature", 1, app.link_signature)
+                parameters = {"job": 1, "run": 3}
+                self.assertEqual(db.execute(app.CHANGE_ROWS + "SELECT change_kind FROM comparison WHERE change_kind<>''",
+                                            parameters).fetchall(), [("recovered",)])
+                self.assertEqual(db.execute("SELECT next_run FROM jobs").fetchone()[0], schedule)
+                self.assertEqual(db.execute("SELECT inherited FROM run_plans WHERE run_id=3").fetchone()[0], 1)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM results WHERE run_id=2").fetchone()[0], 4)
+                db.execute("INSERT INTO runs VALUES (4,1,'now','done')")
+                db.execute("INSERT INTO results VALUES (4,?,?,200,'gefunden','',?)",
+                           (sources[1], sources[1], json.dumps([edited])))
+                parameters["run"] = 4
+                self.assertEqual(db.execute(app.CHANGE_ROWS + "SELECT change_kind FROM comparison",
+                                            parameters).fetchone()[0], "edited")

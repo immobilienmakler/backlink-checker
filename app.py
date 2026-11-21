@@ -57,6 +57,15 @@ def initialize():
         );
         CREATE INDEX IF NOT EXISTS result_run_source ON results(run_id,source);
         CREATE INDEX IF NOT EXISTS run_job ON runs(job_id);
+        CREATE INDEX IF NOT EXISTS result_source_run ON results(source,run_id);
+        CREATE TABLE IF NOT EXISTS run_plans (
+          run_id INTEGER PRIMARY KEY, sources TEXT NOT NULL, mode TEXT NOT NULL, inherited INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS retries (
+          job_id INTEGER PRIMARY KEY, mode TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO run_plans
+          SELECT r.id,j.sources,'full',0 FROM runs r JOIN jobs j ON j.id=r.job_id WHERE r.finished IS NULL;
         """)
 
 
@@ -99,18 +108,32 @@ def execute_next():
     with closing(connect()) as db:
         with db:
             db.execute("BEGIN IMMEDIATE")
-            job = db.execute("""SELECT j.id,j.target,j.exact,j.sources,r.id
+            job = db.execute("""SELECT j.id,j.target,j.exact,COALESCE(p.sources,j.sources),r.id,
+                                       COALESCE(p.mode,'full')
                                 FROM runs r JOIN jobs j ON j.id=r.job_id
+                                LEFT JOIN run_plans p ON p.run_id=r.id
                                 WHERE r.finished IS NULL ORDER BY r.id LIMIT 1""").fetchone()
             if job is None:
-                job = db.execute("""SELECT id,target,exact,sources,NULL FROM jobs
-                                    WHERE next_run <= unixepoch() ORDER BY next_run,id LIMIT 1""").fetchone()
+                job = db.execute("""SELECT j.id,j.target,j.exact,j.sources,NULL,COALESCE(q.mode,'full')
+                                    FROM jobs j LEFT JOIN retries q ON q.job_id=j.id
+                                    WHERE j.next_run <= unixepoch() OR q.job_id IS NOT NULL
+                                    ORDER BY CASE WHEN q.job_id IS NOT NULL THEN 0 ELSE 1 END,j.next_run,j.id LIMIT 1""").fetchone()
             if job is None:
                 return False
-            job_id, target, exact, sources, run_id = job
+            job_id, target, exact, sources, run_id, mode = job
             if run_id is None:
+                inherited = 0
+                if mode != "full":
+                    db.execute("DELETE FROM retries WHERE job_id=?", (job_id,))
+                    inherited = inherited_sources(db, job_id, sources, mode)
+                    if inherited == len(json.loads(sources)):
+                        return True
                 run_id = db.execute("INSERT INTO runs(job_id,started) VALUES (?,?)", (job_id, now())).lastrowid
-                db.execute("UPDATE jobs SET next_run=NULL WHERE id=?", (job_id,))
+                db.execute("INSERT INTO run_plans VALUES (?,?,?,?)", (run_id, sources, mode, inherited))
+                if inherited:
+                    inherited_sources(db, job_id, sources, mode, run_id)
+                if mode == "full":
+                    db.execute("UPDATE jobs SET next_run=NULL WHERE id=?", (job_id,))
         done = {row[0] for row in db.execute("SELECT source FROM results WHERE run_id=?", (run_id,))}
         batch = []
         next_write = monotonic() + 2
@@ -124,8 +147,9 @@ def execute_next():
         save_results(db, batch)
         with db:
             db.execute("UPDATE runs SET finished=? WHERE id=?", (now(), run_id))
-            db.execute("""UPDATE jobs SET next_run=COALESCE(next_run,unixepoch()+interval_hours*3600)
-                          WHERE id=? AND interval_hours>0""", (job_id,))
+            if mode == "full":
+                db.execute("""UPDATE jobs SET next_run=COALESCE(next_run,unixepoch()+interval_hours*3600)
+                              WHERE id=? AND interval_hours>0""", (job_id,))
     return True
 
 
@@ -162,8 +186,7 @@ def import_urls(raw):
             yield number, line
 
 
-def clean_form(form):
-    target = normalize(form.get("target", [""])[0])
+def read_sources(form):
     sources = {}
     for name in ("sources", "source_file"):
         raw = form.get(name, [""])[0]
@@ -177,6 +200,12 @@ def clean_form(form):
             sources[source] = None
             if len(sources) > MAX_SOURCES:
                 raise ValueError("Maximal 25.000 eindeutige Quell-URLs pro Auftrag.")
+    return list(sources)
+
+
+def clean_form(form):
+    target = normalize(form.get("target", [""])[0])
+    sources = read_sources(form)
     interval = int(form.get("interval", ["0"])[0])
     if not sources or interval not in {0, 1, 24, 168}:
         raise ValueError("Bitte mindestens eine Quell-URL und ein gültiges Prüfintervall angeben.")
@@ -200,7 +229,7 @@ def read_form(handler):
     form = {}
     for part in message.iter_parts():
         name = part.get_param("name", header="content-disposition")
-        if name in {"csrf", "target", "sources", "source_file", "interval", "match"} and not part.is_multipart():
+        if name in {"csrf", "target", "sources", "source_file", "interval", "match", "action"} and not part.is_multipart():
             form[name] = [part.get_payload(decode=True).decode("utf-8-sig")]
     return form
 
@@ -226,7 +255,8 @@ def domain_jobs(db):
           JOIN runs p ON p.job_id=l.job_id AND p.id<l.run_id AND p.finished IS NOT NULL
           GROUP BY l.job_id
         )
-        SELECT j.id,j.target,j.exact,j.interval_hours,j.next_run,r.id,r.finished,
+        SELECT j.id,j.target,j.exact,j.interval_hours,
+          CASE WHEN q.job_id IS NOT NULL THEN unixepoch() ELSE j.next_run END,r.id,r.finished,
           COUNT(s.source),
           COUNT(CASE WHEN s.status='gefunden' THEN 1 END),
           COUNT(CASE WHEN s.status='fehlt' THEN 1 END),
@@ -234,7 +264,7 @@ def domain_jobs(db):
           COUNT(CASE WHEN s.status='gefunden' AND old.status='fehlt' THEN 1 END),
           COUNT(CASE WHEN s.status='fehlt' AND old.status='gefunden' THEN 1 END),
           (SELECT MAX(id) FROM runs WHERE job_id=j.id AND finished IS NULL)
-        FROM jobs j LEFT JOIN latest l ON j.id=l.job_id
+        FROM jobs j LEFT JOIN latest l ON j.id=l.job_id LEFT JOIN retries q ON q.job_id=j.id
         LEFT JOIN comparison c ON c.job_id=j.id
         LEFT JOIN runs r ON r.id=l.run_id LEFT JOIN results s ON s.run_id=r.id
         LEFT JOIN results old ON old.run_id=c.previous AND old.source=s.source
@@ -284,10 +314,93 @@ def dashboard_domain_row(domain, data):
     <td>{last}</td><td>{'<br>'.join(activity)}</td></tr>"""
 
 
+RETRY_MODES = {
+    "missing": ("fehlt",),
+    "unavailable": ("nicht prüfbar",),
+    "attention": ("fehlt", "nicht prüfbar"),
+}
+
+
+def inherited_sources(db, job_id, sources, mode, run_id=None):
+    source = mode.removeprefix("source:") if mode.startswith("source:") else None
+    statuses = RETRY_MODES.get(mode, ("",))
+    query = """
+        FROM json_each(:sources) active CROSS JOIN results s
+        WHERE s.source=active.value AND s.run_id=(SELECT MAX(id) FROM runs WHERE job_id=:job AND finished IS NOT NULL)
+          AND CASE WHEN :source IS NULL THEN s.status NOT IN (:first,:last) ELSE s.source<>:source END
+    """
+    params = {"job": job_id, "sources": sources, "first": statuses[0], "last": statuses[-1],
+              "run": run_id, "source": source}
+    if run_id is None:
+        return db.execute("SELECT COUNT(*) " + query, params).fetchone()[0]
+    db.execute("INSERT INTO results SELECT :run,s.source,s.final,s.http,s.status,s.detail,s.links " + query, params)
+
+
+def update_sources(db, job_id, current, form, action):
+    if action == "remove":
+        source = form.get("source", [""])[0]
+        updated = [entry for entry in current if entry != source]
+        if not updated:
+            raise ValueError("Mindestens eine aktive Quelle muss im Auftrag bleiben.")
+        note = f"{len(current) - len(updated)} Quelle aus dem Auftrag entfernt."
+    else:
+        imported = read_sources(form)
+        if not imported:
+            raise ValueError("Bitte eine Quellenliste einfügen oder hochladen.")
+        updated = list(dict.fromkeys([*current, *imported]))
+        if len(updated) > MAX_SOURCES:
+            raise ValueError("Der Auftrag darf insgesamt höchstens 25.000 eindeutige Quellen enthalten.")
+        note = f"{len(updated) - len(current)} Quellen ergänzt."
+    db.execute("UPDATE jobs SET sources=? WHERE id=?", (json.dumps(updated), job_id))
+    return note
+
+
 def queue_jobs(db, job_ids):
+    db.executemany("DELETE FROM retries WHERE job_id=?", [(job_id,) for job_id in job_ids])
     db.executemany("""UPDATE jobs SET next_run=unixepoch() WHERE id=? AND NOT EXISTS
                      (SELECT 1 FROM runs WHERE job_id=jobs.id AND finished IS NULL)""",
                    [(job_id,) for job_id in job_ids])
+
+
+CHANGE_LABELS = {
+    "new": "Hinzugekommen",
+    "lost": "Verloren",
+    "recovered": "Wiedergefunden",
+    "edited": "Linkdetails geändert",
+}
+CHANGE_ROWS = """
+    WITH previous AS (
+      SELECT MAX(id) AS run_id FROM runs WHERE job_id=:job AND id<:run AND finished IS NOT NULL
+    ), comparison AS (
+      SELECT s.rowid AS result_id, s.status,
+        CASE
+          WHEN s.status='gefunden' AND old.status='fehlt' THEN
+            CASE WHEN EXISTS (
+              SELECT 1 FROM results h JOIN runs r ON r.id=h.run_id
+              WHERE h.source=s.source AND r.job_id=:job AND r.finished IS NOT NULL
+                AND h.run_id<previous.run_id AND h.status='gefunden'
+            ) THEN 'recovered' ELSE 'new' END
+          WHEN s.status='fehlt' AND old.status='gefunden' THEN 'lost'
+          WHEN s.status='gefunden' AND old.status='gefunden' AND s.links<>old.links
+            AND link_signature(s.links)<>link_signature(old.links) THEN 'edited'
+          ELSE ''
+        END AS change_kind
+      FROM results s CROSS JOIN previous
+      LEFT JOIN results old ON old.run_id=previous.run_id AND old.source=s.source
+      WHERE s.run_id=:run
+    )
+"""
+
+
+def link_signature(data):
+    return json.dumps(sorted({(link["url"], link["anchor"], link["rel"]) for link in json.loads(data)}))
+
+
+def read_query(query):
+    try:
+        return parse_qs(query, max_num_fields=10)
+    except ValueError:
+        return {}
 
 
 def safe_csv(value):
@@ -372,6 +485,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.domain(unquote(parts[1]))
             elif len(parts) == 2 and parts[0] == "jobs" and parts[1].isascii() and parts[1].isdigit() and len(parts[1]) < 19:
                 self.job(int(parts[1]))
+            elif len(parts) == 3 and parts[0] == "jobs" and parts[2] == "sources" and parts[1].isascii() and parts[1].isdigit() and len(parts[1]) < 19:
+                self.sources(int(parts[1]), url.query)
             elif len(parts) == 3 and parts[0] == "runs" and parts[1].isascii() and parts[1].isdigit() and len(parts[1]) < 19:
                 self.run_report(int(parts[1]), parts[2])
             else:
@@ -469,10 +584,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def job(self, job_id):
         with closing(connect()) as db:
-            job = db.execute("SELECT target,interval_hours,next_run FROM jobs WHERE id=?", (job_id,)).fetchone()
+            job = db.execute("""SELECT j.target,j.interval_hours,j.next_run,q.mode
+                              FROM jobs j LEFT JOIN retries q ON q.job_id=j.id WHERE j.id=?""", (job_id,)).fetchone()
             runs = db.execute("""SELECT r.id,r.started,r.finished,
-                SUM(CASE WHEN s.status='gefunden' THEN 1 ELSE 0 END),COUNT(s.source)
-                FROM runs r LEFT JOIN results s ON s.run_id=r.id WHERE r.job_id=?
+                SUM(CASE WHEN s.status='gefunden' THEN 1 ELSE 0 END),COUNT(s.source),COALESCE(p.mode,'full')
+                FROM runs r LEFT JOIN results s ON s.run_id=r.id
+                LEFT JOIN run_plans p ON p.run_id=r.id WHERE r.job_id=?
                 GROUP BY r.id ORDER BY r.id DESC""", (job_id,)).fetchall()
         if job is None:
             self.send_body(page("Prüfauftrag nicht gefunden", ""), 404)
@@ -483,30 +600,100 @@ class Handler(BaseHTTPRequestHandler):
         if job[1]:
             controls += action("stop", "Automatik stoppen")
         rows = "".join(f'<li><a href="/runs/{i}/report">{started}</a>'
-                       f'<small>{found}/{total} gefunden · {"abgeschlossen" if finished else "läuft"}</small></li>'
-                       for i, started, finished, found, total in runs)
+                       f'<small>{found}/{total} gefunden · {"abgeschlossen" if finished else "läuft"}'
+                       f' · {"Vollprüfung" if mode == "full" else "Nachprüfung"}</small></li>'
+                       for i, started, finished, found, total, mode in runs)
         schedule = datetime.fromtimestamp(job[2], timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if job[2] else ""
         suffix = f" · Nächste Prüfung {schedule}" if schedule else ""
         self.send_body(page(job[0], f"""<p><a href="{domain_path(domain_key(job[0]))}">Zur Domain</a></p>
         <p>{"Intervall " + str(job[1]) + " h" if job[1] else "Manuelle Prüfung"}{suffix}</p>
+        <p><a href="/jobs/{job_id}/sources">Quellen verwalten</a></p>
+        {'<p>Nachprüfung wartet auf Ausführung.</p>' if job[3] else ''}
         <form class="actions" method="post" action="/jobs/{job_id}">
         <input type="hidden" name="csrf" value="{TOKEN}">{controls}</form>
+        <h2>Gezielt nachprüfen</h2>
+        <form class="actions" method="post" action="/jobs/{job_id}">
+        <input type="hidden" name="csrf" value="{TOKEN}">
+        {action("missing", "Fehlende Quellen")}
+        {action("unavailable", "Abruffehler")}
+        {action("attention", "Fehlende Quellen und Abruffehler")}</form>
         <h2>Verlauf</h2><ul class="entries">{rows or "<li>Prüfung wartet auf Ausführung.</li>"}</ul>"""))
 
-    def export_run(self, db, run_id, mode):
+    def sources(self, job_id, query):
+        with closing(connect()) as db:
+            job = db.execute("SELECT target,sources FROM jobs WHERE id=?", (job_id,)).fetchone()
+            shared = set()
+            if job:
+                domain = domain_key(job[0])
+                sources = json.loads(job[1])
+                own = set(sources)
+                for target, stored in db.execute("SELECT target,sources FROM jobs WHERE id<>?", (job_id,)):
+                    if domain_key(target) == domain:
+                        shared.update(own.intersection(json.loads(stored)))
+        if job is None:
+            self.send_body(page("Prüfauftrag nicht gefunden", ""), 404)
+            return
+        try:
+            params = parse_qs(query, max_num_fields=6)
+        except ValueError:
+            params = {}
+        search = params.get("q", [""])[0][:250]
+        matching = [source for source in sources if search.casefold() in source.casefold()]
+        raw = params.get("page", ["1"])[0]
+        number = max(1, int(raw)) if raw.isascii() and raw.isdigit() and len(raw) < 6 else 1
+        pages = max(1, (len(matching) + PAGE_SIZE - 1) // PAGE_SIZE)
+        number = min(number, pages)
+        feedback = params.get("updated", [""])[0][:160]
+        rows = "".join(f'<li>{escape(source)}'
+                       f'{"<small>Auch in einem anderen Auftrag dieser Domain</small>" if source in shared else ""}'
+                       f'<form class="inline" method="post" action="/jobs/{job_id}">'
+                       f'<input type="hidden" name="csrf" value="{TOKEN}">'
+                       f'<input type="hidden" name="source" value="{escape(source)}">'
+                       '<button name="action" value="retry-source">Nachprüfen</button> '
+                       '<button name="action" value="remove">Für künftige Prüfungen entfernen</button></form></li>'
+                       for source in matching[(number - 1) * PAGE_SIZE:number * PAGE_SIZE])
+        links = "".join(f' · <a href="?{escape(urlencode({"q": search, "page": value}))}">{label}</a>'
+                        for value, label in ((number-1, "Zurück"), (number+1, "Weiter")) if 1 <= value <= pages)
+        self.send_body(page("Quellen verwalten", f"""
+        <p><a href="/jobs/{job_id}">Zum Prüfauftrag</a> · {escape(job[0])} · {len(sources)} aktive Quellen</p>
+        {f'<p role="status">{escape(feedback)}</p>' if feedback else ''}
+        <h2>Quellen ergänzen</h2>
+        <form method="post" action="/jobs/{job_id}" enctype="multipart/form-data">
+        <input type="hidden" name="csrf" value="{TOKEN}">
+        <label>Quellseiten<textarea name="sources" rows="4" placeholder="Eine URL pro Zeile"></textarea></label>
+        <label>CSV-, TSV- oder Textdatei<input type="file" name="source_file" accept=".csv,.tsv,.txt"></label>
+        <button name="action" value="append">Quellen ergänzen</button></form>
+        <h2>Aktive Quellen</h2>
+        {f'<p>{len(shared)} Quellen kommen auch in anderen Aufträgen dieser Domain vor.</p>' if shared else ''}
+        <form method="get" class="filters"><label>URL suchen<input name="q" type="search" value="{escape(search)}"></label>
+        <button>Filtern</button></form>
+        <ul class="entries source-list">{rows or '<li>Keine passenden Quellen.</li>'}</ul>
+        <p>Seite {number} von {pages}{links}</p>"""))
+
+    def export_run(self, db, run_id, mode, filters):
         fields = ("quelle", "effektive_quelle", "http_status", "status", "detail", "links")
         mime = "application/json" if mode == "json" else "text/csv"
         self.send_response(200)
         self.send_header("Content-Type", mime + "; charset=utf-8")
-        self.send_header("Content-Disposition", f'attachment; filename="backlinks-{run_id}.{mode}"')
+        extension = "csv" if mode == "changes" else mode
+        suffix = "-aenderungen" if mode == "changes" else ""
+        self.send_header("Content-Disposition", f'attachment; filename="backlinks-{run_id}{suffix}.{extension}"')
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
 
-        rows = db.execute("SELECT source,final,http,status,detail,links FROM results WHERE run_id=? ORDER BY rowid",
-                          (run_id,))
+        if mode == "changes":
+            rows = db.execute(CHANGE_ROWS + """
+                SELECT s.source,s.final,s.http,s.status,s.detail,c.change_kind,s.links
+                FROM comparison c JOIN results s ON s.rowid=c.result_id
+                WHERE c.change_kind<>'' AND (:change='' OR c.change_kind=:change)
+                  AND (:status='' OR c.status=:status) ORDER BY s.rowid
+            """, filters)
+        else:
+            rows = db.execute("SELECT source,final,http,status,detail,links FROM results WHERE run_id=? ORDER BY rowid",
+                              (run_id,))
         write = self.wfile.write
         try:
             if mode == "json":
@@ -518,9 +705,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 buffer = io.StringIO()
                 writer = csv.writer(buffer, delimiter=";")
-                writer.writerow((*fields[:-1], "ziel", "ankertext", "rel"))
+                heading = (*fields[:-1], "änderung") if mode == "changes" else fields[:-1]
+                writer.writerow((*heading, "ziel", "ankertext", "rel"))
                 write(("\ufeff" + buffer.getvalue()).encode())
                 for *values, data in rows:
+                    if mode == "changes":
+                        values[-1] = CHANGE_LABELS[values[-1]]
                     buffer.seek(0)
                     buffer.truncate()
                     for link in json.loads(data) or [{"url": "", "anchor": "", "rel": ""}]:
@@ -532,49 +722,57 @@ class Handler(BaseHTTPRequestHandler):
     def run_report(self, run_id, mode):
         with closing(connect()) as db, db:
             db.execute("BEGIN")
-            run = db.execute("""SELECT r.job_id,r.started,r.finished,json_array_length(j.sources)
-                              FROM runs r JOIN jobs j ON j.id=r.job_id WHERE r.id=?""", (run_id,)).fetchone()
-            if not run or mode not in {"report", "csv", "json"}:
+            run = db.execute("""SELECT r.job_id,r.started,r.finished,json_array_length(COALESCE(p.sources,j.sources)),
+                                       COALESCE(p.mode,'full'),COALESCE(p.inherited,0)
+                                FROM runs r JOIN jobs j ON j.id=r.job_id
+                                LEFT JOIN run_plans p ON p.run_id=r.id WHERE r.id=?""", (run_id,)).fetchone()
+            if not run or mode not in {"report", "csv", "json", "changes"}:
                 self.send_body(page("Prüflauf nicht gefunden", ""), 404)
                 return
-            if mode in {"csv", "json"}:
-                self.export_run(db, run_id, mode)
-                return
-            try:
-                query = parse_qs(urlsplit(self.path).query, max_num_fields=6)
-            except ValueError:
-                query = {}
+            query = read_query(urlsplit(self.path).query)
             selection = query.get("status", [""])[0]
+            change_filter = query.get("change", [""])[0]
+            if selection not in STATUSES:
+                selection = ""
+            if change_filter not in {"any", *CHANGE_LABELS}:
+                change_filter = ""
+            filters = {"run": run_id, "job": run[0], "status": selection,
+                       "change": "" if change_filter == "any" else change_filter}
+            db.create_function("link_signature", 1, link_signature, deterministic=True)
+            if mode in {"csv", "json", "changes"}:
+                self.export_run(db, run_id, mode, filters)
+                return
             raw_page = query.get("page", ["1"])[0]
             page_number = max(1, int(raw_page)) if raw_page.isascii() and raw_page.isdigit() and len(raw_page) <= 6 else 1
             counts = dict(db.execute("SELECT status,COUNT(*) FROM results WHERE run_id=? GROUP BY status", (run_id,)))
             processed = sum(counts.values())
-            if selection not in STATUSES:
-                selection = ""
-            matching = counts.get(selection, 0) if selection else processed
+            condition = """(:status='' OR c.status=:status) AND
+                           (:selected='' OR (c.change_kind<>'' AND (:change='' OR c.change_kind=:change)))"""
+            filters["selected"] = change_filter
+            if change_filter:
+                matching = db.execute(CHANGE_ROWS + f"SELECT COUNT(*) FROM comparison c WHERE {condition}", filters).fetchone()[0]
+            else:
+                matching = counts.get(selection, 0) if selection else processed
             pages = max(1, (matching + PAGE_SIZE - 1) // PAGE_SIZE)
             page_number = min(page_number, pages)
-            rows = db.execute("""SELECT s.source,s.final,s.http,s.status,s.detail,s.links,old.status
-                FROM results s LEFT JOIN results old ON old.source=s.source AND old.run_id=(
-                  SELECT MAX(id) FROM runs WHERE job_id=? AND id<? AND finished IS NOT NULL)
-                WHERE s.run_id=? AND (?='' OR s.status=?)
-                ORDER BY s.rowid LIMIT ? OFFSET ?""",
-                (run[0], run_id, run_id, selection, selection, PAGE_SIZE, (page_number - 1) * PAGE_SIZE)).fetchall()
-        changes = {("fehlt", "gefunden"): "Hinzugekommen", ("gefunden", "fehlt"): "Verloren"}
+            filters.update(limit=PAGE_SIZE, offset=(page_number - 1) * PAGE_SIZE)
+            rows = db.execute(CHANGE_ROWS + f"""SELECT s.source,s.final,s.http,s.status,s.detail,s.links,c.change_kind
+                FROM comparison c JOIN results s ON s.rowid=c.result_id WHERE {condition}
+                ORDER BY s.rowid LIMIT :limit OFFSET :offset""", filters).fetchall()
         table = []
-        for source, final, http, status, detail, data, previous in rows:
+        for source, final, http, status, detail, data, kind in rows:
             found = json.loads(data)
             links = "".join(f'<li>{escape(link["url"])}<br><small>{escape(link["anchor"] or "(ohne Text)")} · '
                             f'{escape(link["rel"] or "ohne rel")}</small></li>' for link in found[:10])
             if len(found) > 10:
                 links += f"<li><small>{len(found) - 10} weitere Links im Export</small></li>"
             redirect = f'<small>Weiter zu {escape(final)}</small>' if source != final else ""
-            change = changes.get((previous, status), "")
+            change = CHANGE_LABELS.get(kind, "")
             table.append(f'<tr><td>{escape(source)}{redirect}</td>'
                          f'<td>{escape(status)} {http or ""}<small>{escape(detail or change)}</small></td><td><ul>{links}</ul></td></tr>')
         summary = " · ".join(f"{counts.get(key, 0)} {key}" for key in STATUSES)
         def report_link(number, label):
-            query_string = escape(urlencode({"page": number, "status": selection}))
+            query_string = escape(urlencode({"page": number, "status": selection, "change": change_filter}))
             return f'<a href="?{query_string}">{label}</a>'
         pagination = [f"Seite {page_number} von {pages}"]
         if page_number > 1:
@@ -583,12 +781,21 @@ class Handler(BaseHTTPRequestHandler):
             pagination.append(report_link(page_number + 1, "Weiter"))
         options = "".join(f'<option value="{escape(key)}" {"selected" if key == selection else ""}>{label}</option>'
                           for key, label in [("", "Alle Ergebnisse"), *((key, key.capitalize()) for key in STATUSES)])
-        progress = f"{processed:,} von {max(run[3], processed):,} Quellen geprüft".replace(",", ".")
+        change_options = "".join(
+            f'<option value="{key}" {"selected" if key == change_filter else ""}>{label}</option>'
+            for key, label in [("", "Alle Ergebnisse"), ("any", "Nur Änderungen"), *CHANGE_LABELS.items()]
+        )
+        progress = f"{processed - run[5]:,} von {max(run[3], processed) - run[5]:,} Quellen geprüft".replace(",", ".")
+        inherited = f" · {run[5]} Ergebnisse aus dem vorherigen Lauf übernommen" if run[4] != "full" else ""
+        change_export = escape(urlencode({"status": selection, "change": change_filter}))
+
         self.send_body(page("Prüfergebnis", f"""<p><a href="/jobs/{run[0]}">Zum Prüfauftrag</a></p>
-        <p>{run[1]} · {"abgeschlossen" if run[2] else "läuft"} · {progress}</p>
+        <p>{run[1]} · {"abgeschlossen" if run[2] else "läuft"} · {progress}{inherited}</p>
         <p>{summary}</p><p><a href="csv">Alle als CSV</a> · <a href="json">Alle als JSON</a>
+        · <a href="changes?{change_export}">Änderungen als CSV</a>
         {' · ' + report_link(page_number, 'Aktualisieren') if not run[2] else ''}</p>
-        <form method="get" class="filters"><label>Status<select name="status">{options}</select></label><button>Filtern</button></form>
+        <form method="get" class="filters"><label>Status<select name="status">{options}</select></label>
+        <label>Änderung<select name="change">{change_options}</select></label><button>Filtern</button></form>
         <div class="scroll"><table><thead><tr><th>Quelle</th><th>Status</th><th>Gefundene Links</th></tr></thead>
         <tbody>{"".join(table) or '<tr><td colspan="3">Keine Ergebnisse für diese Auswahl.</td></tr>'}</tbody></table></div>
         <p aria-label="Seitennavigation">{" · ".join(pagination)}</p>"""))
@@ -619,7 +826,30 @@ class Handler(BaseHTTPRequestHandler):
                 elif len(path) == 2 and path[0] == "jobs" and path[1].isascii() and path[1].isdigit() and len(path[1]) < 19:
                     job_id = int(path[1])
                     action = form.get("action", [""])[0]
-                    if action == "run":
+                    db.execute("BEGIN IMMEDIATE")
+                    job = db.execute("SELECT sources FROM jobs WHERE id=?", (job_id,)).fetchone()
+                    if job is None:
+                        self.send_body(page("Prüfauftrag nicht gefunden", ""), 404)
+                        return
+                    if action in {"append", "remove"}:
+                        feedback = update_sources(db, job_id, json.loads(job[0]), form, action)
+                        location = f"/jobs/{job_id}/sources?" + urlencode({"updated": feedback})
+                    elif action in RETRY_MODES or action == "retry-source":
+                        mode = action
+                        if action == "retry-source":
+                            source = form.get("source", [""])[0]
+                            if source not in json.loads(job[0]):
+                                raise ValueError("Die ausgewählte Quelle ist nicht mehr aktiv.")
+                            mode = "source:" + source
+                        if db.execute("SELECT 1 FROM runs WHERE job_id=? AND finished IS NULL", (job_id,)).fetchone():
+                            raise ValueError("Bitte warte auf den Abschluss der laufenden Prüfung.")
+                        if not db.execute("SELECT 1 FROM runs WHERE job_id=? AND finished IS NOT NULL", (job_id,)).fetchone():
+                            raise ValueError("Für eine gezielte Nachprüfung ist zuerst eine Vollprüfung nötig.")
+                        inherited = inherited_sources(db, job_id, job[0], mode)
+                        if inherited == len(json.loads(job[0])):
+                            raise ValueError("Für diese Auswahl gibt es keine nachzuprüfenden Quellen.")
+                        db.execute("INSERT OR REPLACE INTO retries VALUES (?,?)", (job_id, mode))
+                    elif action == "run":
                         queue_jobs(db, [job_id])
                     elif action == "stop":
                         db.execute("UPDATE jobs SET interval_hours=0,next_run=NULL WHERE id=?", (job_id,))
@@ -629,6 +859,10 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_body(page("Seite nicht gefunden", ""), 404)
                     return
         except (ValueError, csv.Error) as exc:
+            if "job_id" in locals():
+                back = f"/jobs/{job_id}" + ("/sources" if form.get("action", [""])[0] in {"append", "remove", "retry-source"} else "")
+                self.send_body(page("Eingabe prüfen", f'<p role="alert">{escape(str(exc))}</p><a href="{back}">Zurück</a>'), 400)
+                return
             self.send_body(page("Eingabe prüfen", f'<p role="alert">{escape(str(exc))}</p>' + create_form(
                 form.get("target", [""])[0], form.get("sources", [""])[0][:50_000], form.get("interval", ["0"])[0],
                 form.get("match") == ["exact"])), 400)

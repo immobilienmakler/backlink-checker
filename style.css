@@ -44,3 +44,6 @@ td li+li{margin-top:.5rem}
 .gain{color:#17594a}
 .loss{color:#971c35}
 .caption,.empty{font-size:.875rem}
+.source-list li{overflow-wrap:anywhere}
+.source-list .inline{display:inline-block;padding:0;margin:.25rem .5rem;border:0}
+.source-list button{background:white;color:var(--accent);border:1px solid var(--line);font-size:.85rem;padding:.3rem .55rem}

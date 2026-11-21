@@ -121,3 +121,10 @@ Der Vergleich verwendet pro Auftrag die letzten zwei abgeschlossenen Läufe. Ein
 4. Filtere die Ergebnisse nach Status oder blättere durch die Seiten mit je 100 Quellen. CSV und JSON enthalten alle bis zum Exportstart vorliegenden Ergebnisse des Laufs. Bei einem Neustart werden bereits gespeicherte Quellen desselben Laufs übersprungen.
 
 Die Kapazitätsgrenze zählt Quell-URLs. Die Anzahl der tatsächlich gefundenen Links kann davon abweichen. Wiederholungsintervalle werden jeweils ab dem Abschluss des letzten Laufs berechnet.
+
+### Quellen pflegen und Änderungen bearbeiten
+
+- Öffne einen Prüfauftrag und klicke auf **Quellen verwalten**. Ergänze eine CSV-, TSV- oder Textdatei oder füge URLs ein. Duplikate im Auftrag werden beim Import entfernt. Quellen, die auch in einem anderen Auftrag derselben Domain stehen, sind markiert. Das ist sinnvoll, wenn eine Quelle mehrere Zielseiten verlinkt.
+- Über die URL-Suche findest du einzelne Quellen. **Für künftige Prüfungen entfernen** entfernt sie aus der aktiven Liste. Bereits gespeicherte Ergebnisse und schon gestartete Läufe behalten ihre ursprüngliche Quellenliste. Du kannst eine entfernte URL später erneut importieren.
+- Unter **Gezielt nachprüfen** wählst du fehlende Backlinks, Abruffehler oder beides. Eine einzelne URL kannst du über **Quellen verwalten → Nachprüfen** auswählen. Die Nachprüfung ruft diese und noch ungeprüfte Quellen ab. Die übrigen aktiven Ergebnisse übernimmt sie aus dem letzten abgeschlossenen Lauf und weist deren Anzahl separat aus. Der Zeitplan der nächsten Vollprüfung bleibt bestehen. HTTP 429 und 503 werden einmal wiederholt, wenn die angegebene Wartezeit höchstens zehn Sekunden beträgt. Ohne gültigen `Retry-After` wartet die App zwei Sekunden.
+- Im Prüfbericht kannst du **Änderung** nach hinzugekommenen, verlorenen oder wiedergefundenen Backlinks und geänderten Linkdetails filtern. Ziel-URL, Ankertext und `rel` werden als Menge verglichen, sodass eine andere Reihenfolge derselben Links keine Änderung auslöst. **Änderungen als CSV** exportiert die gefilterte Arbeitsliste über alle Seiten des Berichts.

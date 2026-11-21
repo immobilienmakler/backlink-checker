@@ -3,7 +3,10 @@ import http.client
 import ipaddress
 import socket
 import ssl
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
+from time import sleep
 from urllib.parse import urldefrag, urljoin, urlsplit, urlunsplit
 
 MAX_BODY = 2 * 1024 * 1024
@@ -38,8 +41,24 @@ def public_address(host, port):
     return addresses[0][4][0]
 
 
+def retry_delay(value):
+    if not value:
+        return 2
+    try:
+        if value.isascii() and value.isdigit():
+            return float(value)
+        retry_at = parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+    except (ValueError, TypeError, OverflowError):
+        return 2
+
+
 def fetch(url):
-    for _ in range(6):
+    redirects = 0
+    retried = False
+    while redirects <= 5:
         url = normalize(url)
         parts = urlsplit(url)
         secure = parts.scheme == "https"
@@ -60,7 +79,15 @@ def fetch(url):
             location = response.getheader("Location")
             if response.status in REDIRECTS and location:
                 url = urljoin(url, location)
+                redirects += 1
                 continue
+            if response.status in {429, 503} and not retried:
+                delay = retry_delay(response.getheader("Retry-After"))
+                if delay <= 10:
+                    retried = True
+                    connection.close()
+                    sleep(delay)
+                    continue
             content_type = response.headers.get_content_type()
             if response.status >= 400 or content_type not in {"text/html", "application/xhtml+xml"}:
                 return url, response.status, None
