@@ -140,3 +140,14 @@ Bei mehreren gleichwertigen Aufträgen bleibt die Quelle bevorzugt im Auftrag mi
 Im laufenden Bericht findest du eine Fortschrittsanzeige und die Schaltflächen **Prüfung pausieren** und **Prüfung fortsetzen**. Eine Pause greift nach dem aktuellen Arbeitsblock. Bereits angestoßene Abrufe dürfen fertig werden und werden gespeichert. Auch nach einem Container-Neustart bleibt ein pausierter Lauf pausiert.
 
 Der Worker wechselt zwischen offenen Aufträgen. Pro Arbeitsblock verarbeitet er bis zu 128 Quellen und startet nach etwa zehn Sekunden keine weiteren Abrufe für diesen Block. Angefangene Abrufe können länger dauern. Danach ist der nächste offene Auftrag an der Reihe. Dadurch können kleinere Prüfungen abschließen, während ein großer Auftrag noch läuft. Die Begrenzung auf 16 parallele Abrufe und zwei Start-URLs pro Quellhost gilt weiterhin.
+
+### Geänderte Backlink-Quellseiten mit IndexNow melden
+
+IndexNow meldet kürzlich geänderte Seiten auf Hosts, deren Schlüsseldatei du verwaltest. Für eine Seite eines Dritten müsste deren Betreiber den Schlüssel auf seinem Host hinterlegen. Der Checker meldet die tatsächlich abgerufene Quell-URL nach Weiterleitungen.
+
+1. Erzeuge einen IndexNow-Schlüssel. Lege auf deinem Quellhost unter `https://quellhost.example/DEIN-SCHLUESSEL.txt` eine öffentlich erreichbare UTF-8-Textdatei ab, die nur den Schlüssel enthält.
+2. Setze in Portainer die Stack-Umgebungsvariable `INDEXNOW_KEYS` auf ein JSON-Objekt wie `{"quellhost.example":"abcdef123456"}`. Bei Docker Compose kannst du dieselbe Variable in `.env` hinterlegen. Verwende für `www` oder andere Subdomains jeweils den exakten Hostnamen. Bei direktem `docker run` übergib die Variable mit `-e INDEXNOW_KEYS='{"quellhost.example":"abcdef123456"}'`.
+3. Stelle den Container neu bereit. Öffne **Domain → IndexNow** und wähle einen Quellhost. Die Vorschau zählt nur aktive Quellen mit neuem, wiedergefundenem oder geändertem Backlink aus dem jeweils jüngsten abgeschlossenen Lauf innerhalb der letzten sieben Tage. Die erste Prüfung dient als Vergleichsbasis.
+4. Der Checker prüft die HTTPS-Schlüsseldatei und sendet je Anfrage bis zu 10.000 URLs desselben Hosts. Akzeptierte Meldungen werden für diesen Prüflauf gespeichert. Der Dienst leitet Meldungen an teilnehmende Suchmaschinen weiter. Die Annahme ist keine Bestätigung einer Indexierung.
+
+[Offizielle IndexNow-Dokumentation](https://www.indexnow.org/documentation)

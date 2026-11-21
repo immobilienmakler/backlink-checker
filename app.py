@@ -1,6 +1,7 @@
 """Single-user backlink monitor with a persistent SQLite history."""
 import csv
 import hmac
+import http.client
 import io
 import json
 import os
@@ -19,6 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
+import indexnow
 from checker import inspect, normalize
 
 DB = Path(os.environ.get("DATA_DIR", "./data")) / "backlinks.sqlite3"
@@ -32,6 +34,7 @@ WRITE_BATCH = 25
 SLICE_SIZE = 128
 SLICE_SECONDS = 10
 PAGE_SIZE = 100
+INDEXNOW_LOCK = threading.Lock()
 STATUSES = ("gefunden", "fehlt", "nicht prüfbar")
 
 
@@ -69,6 +72,9 @@ def initialize():
         CREATE TABLE IF NOT EXISTS run_controls (
           run_id INTEGER PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0,
           serving INTEGER NOT NULL DEFAULT 0, sequence INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS indexnow_sent (
+          url TEXT PRIMARY KEY, run_id INTEGER NOT NULL, sent_at TEXT NOT NULL
         );
         UPDATE run_controls SET serving=0 WHERE serving<>0;
         INSERT OR IGNORE INTO run_plans
@@ -475,6 +481,27 @@ def link_signature(data):
     return json.dumps(sorted({(link["url"], link["anchor"], link["rel"]) for link in json.loads(data)}))
 
 
+def indexnow_candidates(db, domain, keys):
+    db.create_function("link_signature", 1, link_signature, deterministic=True)
+    grouped = defaultdict(dict)
+    for job in domain_jobs(db).get(domain, []):
+        if not job.run:
+            continue
+        active = db.execute("SELECT sources FROM jobs WHERE id=?", (job.id,)).fetchone()[0]
+        for effective, in db.execute(CHANGE_ROWS + """
+            SELECT DISTINCT s.final FROM comparison c JOIN results s ON s.rowid=c.result_id
+            JOIN runs r ON r.id=s.run_id
+            LEFT JOIN indexnow_sent sent ON sent.url=s.final
+            WHERE s.source IN (SELECT value FROM json_each(:active)) AND c.change_kind IN ('new','recovered','edited') AND s.status='gefunden'
+              AND r.finished>=strftime('%Y-%m-%d %H:%M:%S UTC','now','-7 days')
+              AND (sent.run_id IS NULL OR sent.run_id<:run)
+        """, {"job": job.id, "run": job.run, "active": active}):
+            host = urlsplit(effective).hostname
+            if host in keys:
+                grouped[host][effective] = max(job.run, grouped[host].get(effective, 0))
+    return grouped
+
+
 def read_query(query):
     try:
         return parse_qs(query, max_num_fields=10)
@@ -562,6 +589,8 @@ class Handler(BaseHTTPRequestHandler):
             parts = path.strip("/").split("/")
             if len(parts) == 2 and parts[0] == "domains":
                 self.domain(unquote(parts[1]))
+            elif len(parts) == 3 and parts[0] == "domains" and parts[2] == "indexnow":
+                self.indexnow_page(unquote(parts[1]))
             elif len(parts) == 3 and parts[0] == "domains" and parts[2] == "duplicates":
                 self.duplicates(unquote(parts[1]), url.query)
             elif len(parts) == 2 and parts[0] == "jobs" and parts[1].isascii() and parts[1].isdigit() and len(parts[1]) < 19:
@@ -659,10 +688,78 @@ class Handler(BaseHTTPRequestHandler):
         self.send_body(page(domain, f"""<p><a href="/">Zur Domain-Übersicht</a></p>
         <form class="actions" method="post" action="{domain_path(domain)}">
         <input type="hidden" name="csrf" value="{TOKEN}"><button>Alle Aufträge dieser Domain prüfen</button></form>
-        <p><a href="{domain_path(domain)}/duplicates">Dubletten prüfen und bereinigen</a></p>
+        <p><a href="{domain_path(domain)}/duplicates">Dubletten prüfen und bereinigen</a>
+        · <a href="{domain_path(domain)}/indexnow">IndexNow</a></p>
         <h2>Prüfaufträge</h2><div class="scroll"><table><thead><tr><th>Ziel</th><th>Zeitplan</th>
         <th>Letzter Abschluss</th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>
         <h2>Neuer Prüfauftrag</h2>{create_form(jobs[0][1] if ":" in domain else "https://" + domain + "/")}"""))
+
+    def indexnow_page(self, domain, message=None):
+        try:
+            keys = indexnow.load_keys(os.environ.get("INDEXNOW_KEYS"))
+        except ValueError:
+            keys = {}
+            message = "INDEXNOW_KEYS enthält eine ungültige Konfiguration."
+        with closing(connect()) as db:
+            candidates = indexnow_candidates(db, domain, keys) if keys else {}
+        forms = "".join(f"""<form class="actions" method="post" action="{domain_path(domain)}/indexnow">
+            <input type="hidden" name="csrf" value="{TOKEN}">
+            <button name="host" value="{escape(host)}">{len(urls)} URLs von {escape(host)} melden</button></form>"""
+                        for host, urls in sorted(candidates.items()))
+        summary = "Keine passenden ungemeldeten Änderungen." if keys else "Hinterlege zuerst einen Host und seinen Schlüssel in INDEXNOW_KEYS."
+        self.send_body(page("IndexNow", f"""
+        <p><a href="{domain_path(domain)}">Zur Domain</a> · {escape(domain)}</p>
+        {f'<p role="status">{escape(message)}</p>' if message else ''}
+        <p>Gemeldet werden aktive Quellseiten mit neuem, wiedergefundenem oder geändertem Backlink
+        aus dem letzten abgeschlossenen Lauf eines Auftrags, sofern er höchstens sieben Tage zurückliegt.
+        Der Quellhost braucht eine überprüfbare Schlüsseldatei.</p>
+        {forms or f'<p>{summary}</p>'}"""))
+
+    def send_indexnow(self, domain, host):
+        if not INDEXNOW_LOCK.acquire(blocking=False):
+            self.indexnow_page(domain, "Eine IndexNow-Meldung läuft bereits.")
+            return
+        try:
+            self.send_indexnow_host(domain, host)
+        finally:
+            INDEXNOW_LOCK.release()
+
+    def send_indexnow_host(self, domain, host):
+        try:
+            keys = indexnow.load_keys(os.environ.get("INDEXNOW_KEYS"))
+        except ValueError:
+            self.indexnow_page(domain, "INDEXNOW_KEYS enthält eine ungültige Konfiguration.")
+            return
+        if host not in keys:
+            self.indexnow_page(domain, "Für diesen Host ist kein Schlüssel hinterlegt.")
+            return
+        with closing(connect()) as db:
+            candidates = indexnow_candidates(db, domain, {host: keys[host]}).get(host, {})
+        if not candidates:
+            self.indexnow_page(domain, "Keine passenden ungemeldeten Änderungen.")
+            return
+        sent = 0
+        try:
+            key = keys[host]
+            if not indexnow.verify_key(host, key):
+                self.indexnow_page(domain, "Die HTTPS-Schlüsseldatei im Stammverzeichnis ist nicht gültig.")
+                return
+            urls = sorted(candidates)
+            for start in range(0, len(urls), indexnow.BATCH_SIZE):
+                batch = urls[start:start + indexnow.BATCH_SIZE]
+                status = indexnow.submit_batch(host, key, batch)
+                if status not in indexnow.ACCEPTED:
+                    self.indexnow_page(domain, f"{sent} URLs entgegengenommen. IndexNow antwortete mit HTTP {status}; weitere Pakete wurden nicht gesendet.")
+                    return
+                with closing(connect()) as db, db:
+                    db.executemany("""INSERT INTO indexnow_sent VALUES (?,?,?)
+                                      ON CONFLICT(url) DO UPDATE SET run_id=excluded.run_id,sent_at=excluded.sent_at""",
+                                   [(url, candidates[url], now()) for url in batch])
+                sent += len(batch)
+        except (OSError, ValueError, http.client.HTTPException):
+            self.indexnow_page(domain, f"{sent} URLs entgegengenommen. Bei der Schlüsselprüfung oder Übertragung ist ein Fehler aufgetreten.")
+            return
+        self.indexnow_page(domain, f"IndexNow hat {sent} URLs entgegengenommen.")
 
     def duplicates(self, domain, query):
         with closing(connect()) as db:
@@ -926,6 +1023,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_body(page("Ungültige Anfrage", '<a href="/">Zurück zur Übersicht</a>'), 403)
                 return
             path = urlsplit(self.path).path.strip("/").split("/")
+            if len(path) == 3 and path[0] == "domains" and path[2] == "indexnow":
+                self.send_indexnow(unquote(path[1]), form.get("host", [""])[0])
+                return
             with closing(connect()) as db, db:
                 if (len(path) == 3 and path[0] == "runs" and path[2] == "control"
                         and path[1].isascii() and path[1].isdigit() and len(path[1]) < 19):

@@ -264,3 +264,43 @@ class CheckerTests(unittest.TestCase):
             with app.connect() as db:
                 self.assertEqual(db.execute("SELECT COUNT(DISTINCT source) FROM results WHERE run_id=1").fetchone()[0], 5)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM runs WHERE finished IS NOT NULL").fetchone()[0], 2)
+
+    def test_indexnow_selects_only_active_changed_verified_host_urls(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, "DB", Path(directory) / "test.db"):
+            app.initialize()
+            matching = "https://quelle.example/link"
+            cases = [
+                (matching, "fehlt", True),
+                ("https://fremd.example/link", "fehlt", True),
+                ("https://quelle.example/unveraendert", "gefunden", True),
+                ("https://quelle.example/inaktiv", "fehlt", False),
+            ]
+            with app.connect() as db:
+                db.execute("INSERT INTO jobs VALUES (1,'https://ziel.de/',0,?,0,NULL,'now')",
+                           (json.dumps([source for source, _, active in cases if active]),))
+                db.executemany("INSERT INTO runs VALUES (?,1,?,?)", [(1, app.now(), app.now()), (2, app.now(), app.now())])
+                data = json.dumps([{"url": "https://ziel.de/", "anchor": "", "rel": ""}])
+                for source, previous, _ in cases:
+                    db.execute("INSERT INTO results VALUES (1,?,?,200,?,'',?)",
+                               (source, source, previous, data if previous == "gefunden" else "[]"))
+                    db.execute("INSERT INTO results VALUES (2,?,?,200,'gefunden','',?)", (source, source, data))
+                keys = app.indexnow.load_keys('{"quelle.example":"abcdef123456"}')
+                self.assertEqual(app.indexnow_candidates(db, "ziel.de", keys), {"quelle.example": {matching: 2}})
+
+            class Response:
+                def indexnow_page(self, _domain, message):
+                    self.message = message
+
+            response = Response()
+            with patch.dict(app.os.environ, {"INDEXNOW_KEYS": '{"quelle.example":"abcdef123456"}'}), \
+                    patch.object(app.indexnow, "verify_key", return_value=False), \
+                    patch.object(app.indexnow, "submit_batch") as submit:
+                app.Handler.send_indexnow_host(response, "ziel.de", "quelle.example")
+                submit.assert_not_called()
+            with patch.dict(app.os.environ, {"INDEXNOW_KEYS": '{"quelle.example":"abcdef123456"}'}), \
+                    patch.object(app.indexnow, "verify_key", return_value=True), \
+                    patch.object(app.indexnow, "submit_batch", return_value=202) as submit:
+                app.Handler.send_indexnow_host(response, "ziel.de", "quelle.example")
+                submit.assert_called_once_with("quelle.example", "abcdef123456", [matching])
+            with app.connect() as db:
+                self.assertFalse(app.indexnow_candidates(db, "ziel.de", keys))
