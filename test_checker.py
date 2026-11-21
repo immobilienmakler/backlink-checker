@@ -204,3 +204,27 @@ class CheckerTests(unittest.TestCase):
                 parameters["run"] = 4
                 self.assertEqual(db.execute(app.CHANGE_ROWS + "SELECT change_kind FROM comparison",
                                             parameters).fetchone()[0], "edited")
+
+    def test_dedup_keeps_equivalent_checks_and_preserves_history(self):
+        source = "https://quelle.example/"
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, "DB", Path(directory) / "test.db"):
+            app.initialize()
+            with app.connect() as db:
+                db.executemany("INSERT INTO jobs VALUES (?,?,?,?,?,1,'now')", [
+                    (1, "https://ziel.de/", 0, json.dumps([source]), 24),
+                    (2, "http://ziel.de/pfad", 0, json.dumps([source]), 1),
+                    (3, "https://www.ziel.de/", 0, json.dumps([source]), 1),
+                    (4, "https://ziel.de/", 1, json.dumps([source]), 1),
+                    (5, "https://andere.de/", 0, json.dumps([source]), 1),
+                ])
+                db.execute("INSERT INTO runs VALUES (1,1,'now','done')")
+                db.execute("INSERT INTO results VALUES (1,?,?,200,'gefunden','','[]')", (source, source))
+                changes = app.duplicate_preview(db, "ziel.de")
+                self.assertEqual([(job, duplicates) for job, _, duplicates, _ in changes], [(1, 1)])
+                app.clean_duplicates(db, changes)
+                self.assertEqual(app.duplicate_preview(db, "ziel.de"), [])
+                self.assertEqual(db.execute("SELECT sources,next_run FROM jobs WHERE id=1").fetchone(), ("[]", None))
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM jobs WHERE json_array_length(sources)=1").fetchone(), (4,))
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM results").fetchone(), (1,))
+                app.queue_jobs(db, [1])
+                self.assertIsNone(db.execute("SELECT next_run FROM jobs WHERE id=1").fetchone()[0])

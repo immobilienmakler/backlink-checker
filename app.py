@@ -116,7 +116,8 @@ def execute_next():
             if job is None:
                 job = db.execute("""SELECT j.id,j.target,j.exact,j.sources,NULL,COALESCE(q.mode,'full')
                                     FROM jobs j LEFT JOIN retries q ON q.job_id=j.id
-                                    WHERE j.next_run <= unixepoch() OR q.job_id IS NOT NULL
+                                    WHERE json_array_length(j.sources)>0
+                                      AND (j.next_run <= unixepoch() OR q.job_id IS NOT NULL)
                                     ORDER BY CASE WHEN q.job_id IS NOT NULL THEN 0 ELSE 1 END,j.next_run,j.id LIMIT 1""").fetchone()
             if job is None:
                 return False
@@ -149,7 +150,7 @@ def execute_next():
             db.execute("UPDATE runs SET finished=? WHERE id=?", (now(), run_id))
             if mode == "full":
                 db.execute("""UPDATE jobs SET next_run=COALESCE(next_run,unixepoch()+interval_hours*3600)
-                              WHERE id=? AND interval_hours>0""", (job_id,))
+                              WHERE id=? AND interval_hours>0 AND json_array_length(sources)>0""", (job_id,))
     return True
 
 
@@ -351,15 +352,50 @@ def update_sources(db, job_id, current, form, action):
         if len(updated) > MAX_SOURCES:
             raise ValueError("Der Auftrag darf insgesamt höchstens 25.000 eindeutige Quellen enthalten.")
         note = f"{len(updated) - len(current)} Quellen ergänzt."
-    db.execute("UPDATE jobs SET sources=? WHERE id=?", (json.dumps(updated), job_id))
+    db.execute("""UPDATE jobs SET sources=?,
+                  next_run=CASE WHEN json_array_length(sources)=0 AND interval_hours>0
+                                THEN unixepoch() ELSE next_run END WHERE id=?""",
+               (json.dumps(updated), job_id))
     return note
 
 
 def queue_jobs(db, job_ids):
     db.executemany("DELETE FROM retries WHERE job_id=?", [(job_id,) for job_id in job_ids])
-    db.executemany("""UPDATE jobs SET next_run=unixepoch() WHERE id=? AND NOT EXISTS
+    db.executemany("""UPDATE jobs SET next_run=unixepoch() WHERE id=? AND json_array_length(sources)>0 AND NOT EXISTS
                      (SELECT 1 FROM runs WHERE job_id=jobs.id AND finished IS NULL)""",
                    [(job_id,) for job_id in job_ids])
+
+
+def duplicate_preview(db, domain):
+    jobs = db.execute("""
+        SELECT id,target,exact,sources FROM jobs
+        ORDER BY interval_hours=0,interval_hours,id
+    """)
+    seen = defaultdict(set)
+    changes = []
+    for job_id, target, exact, stored in jobs:
+        if domain_key(target) != domain:
+            continue
+        sources = json.loads(stored)
+        scope = ("exact", target) if exact else ("domain", urlsplit(target).hostname)
+        kept = []
+        for source in sources:
+            if source not in seen[scope]:
+                seen[scope].add(source)
+                kept.append(source)
+        if len(kept) != len(sources):
+            changes.append((job_id, target, len(sources) - len(kept), kept))
+    return changes
+
+
+def clean_duplicates(db, changes):
+    db.executemany("""UPDATE jobs SET sources=?,
+                   next_run=CASE WHEN ?=0 THEN NULL ELSE next_run END WHERE id=?""",
+                   [(json.dumps(kept), len(kept), job_id) for job_id, _, _, kept in changes])
+    db.executemany("""DELETE FROM retries WHERE job_id=? AND (
+                   json_array_length(?)=0 OR (mode LIKE 'source:%' AND NOT EXISTS
+                   (SELECT 1 FROM json_each(?) WHERE value=substr(mode,8))))""",
+                   [(job_id, json.dumps(kept), json.dumps(kept)) for job_id, _, _, kept in changes])
 
 
 CHANGE_LABELS = {
@@ -483,6 +519,8 @@ class Handler(BaseHTTPRequestHandler):
             parts = path.strip("/").split("/")
             if len(parts) == 2 and parts[0] == "domains":
                 self.domain(unquote(parts[1]))
+            elif len(parts) == 3 and parts[0] == "domains" and parts[2] == "duplicates":
+                self.duplicates(unquote(parts[1]), url.query)
             elif len(parts) == 2 and parts[0] == "jobs" and parts[1].isascii() and parts[1].isdigit() and len(parts[1]) < 19:
                 self.job(int(parts[1]))
             elif len(parts) == 3 and parts[0] == "jobs" and parts[2] == "sources" and parts[1].isascii() and parts[1].isdigit() and len(parts[1]) < 19:
@@ -578,13 +616,35 @@ class Handler(BaseHTTPRequestHandler):
         self.send_body(page(domain, f"""<p><a href="/">Zur Domain-Übersicht</a></p>
         <form class="actions" method="post" action="{domain_path(domain)}">
         <input type="hidden" name="csrf" value="{TOKEN}"><button>Alle Aufträge dieser Domain prüfen</button></form>
+        <p><a href="{domain_path(domain)}/duplicates">Dubletten prüfen und bereinigen</a></p>
         <h2>Prüfaufträge</h2><div class="scroll"><table><thead><tr><th>Ziel</th><th>Zeitplan</th>
         <th>Letzter Abschluss</th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>
         <h2>Neuer Prüfauftrag</h2>{create_form(jobs[0][1] if ":" in domain else "https://" + domain + "/")}"""))
 
+    def duplicates(self, domain, query):
+        with closing(connect()) as db:
+            changes = duplicate_preview(db, domain)
+        count = sum(item[2] for item in changes)
+        removed = read_query(query).get("removed", [""])[0]
+        feedback = f'<p role="status">{removed} doppelte Quelleneinträge entfernt.</p>' if removed.isascii() and removed.isdigit() and len(removed) < 12 else ""
+        rows = "".join(f'<li><a href="/jobs/{job_id}">{escape(target)}</a><small>'
+                       f'{duplicates} doppelt · {len(kept)} Quellen verbleiben</small></li>'
+                       for job_id, target, duplicates, kept in changes)
+        form = ""
+        if count:
+            form = f"""<ul class="entries">{rows}</ul>
+            <form method="post" action="{domain_path(domain)}/duplicates">
+            <input type="hidden" name="csrf" value="{TOKEN}">
+            <button>{count} doppelte Quelleneinträge entfernen</button></form>"""
+        self.send_body(page("Dubletten bereinigen", f"""
+        <p><a href="{domain_path(domain)}">Zur Domain</a> · {escape(domain)}</p>{feedback}
+        <p>Eine Quell-URL bleibt pro identischem Abgleich einmal aktiv. Der Auftrag mit dem kürzesten
+        automatischen Intervall hat Vorrang, danach der älteste Auftrag. Frühere Berichte bleiben erhalten.</p>
+        {form or '<p>Keine doppelten Quelleneinträge gefunden.</p>'}"""))
+
     def job(self, job_id):
         with closing(connect()) as db:
-            job = db.execute("""SELECT j.target,j.interval_hours,j.next_run,q.mode
+            job = db.execute("""SELECT j.target,j.interval_hours,j.next_run,q.mode,json_array_length(j.sources)
                               FROM jobs j LEFT JOIN retries q ON q.job_id=j.id WHERE j.id=?""", (job_id,)).fetchone()
             runs = db.execute("""SELECT r.id,r.started,r.finished,
                 SUM(CASE WHEN s.status='gefunden' THEN 1 ELSE 0 END),COUNT(s.source),COALESCE(p.mode,'full')
@@ -596,8 +656,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         def action(value, label):
             return f'<button name="action" value="{value}">{label}</button>'
-        controls = action("run", "Erneut prüfen")
-        if job[1]:
+        controls = action("run", "Erneut prüfen") if job[4] else ""
+        if job[1] and job[4]:
             controls += action("stop", "Automatik stoppen")
         rows = "".join(f'<li><a href="/runs/{i}/report">{started}</a>'
                        f'<small>{found}/{total} gefunden · {"abgeschlossen" if finished else "läuft"}'
@@ -607,7 +667,8 @@ class Handler(BaseHTTPRequestHandler):
         suffix = f" · Nächste Prüfung {schedule}" if schedule else ""
         self.send_body(page(job[0], f"""<p><a href="{domain_path(domain_key(job[0]))}">Zur Domain</a></p>
         <p>{"Intervall " + str(job[1]) + " h" if job[1] else "Manuelle Prüfung"}{suffix}</p>
-        <p><a href="/jobs/{job_id}/sources">Quellen verwalten</a></p>
+        <p><a href="/jobs/{job_id}/sources">Quellen verwalten</a> · {job[4]} aktive Quellen</p>
+        {'<p>Der Auftrag ist ohne aktive Quellen pausiert. Ergänze Quellen, um ihn wieder zu nutzen.</p>' if not job[4] else ''}
         {'<p>Nachprüfung wartet auf Ausführung.</p>' if job[3] else ''}
         <form class="actions" method="post" action="/jobs/{job_id}">
         <input type="hidden" name="csrf" value="{TOKEN}">{controls}</form>
@@ -815,6 +876,13 @@ class Handler(BaseHTTPRequestHandler):
                 if path == ["jobs"]:
                     job_id = db.execute("""INSERT INTO jobs(target,exact,sources,interval_hours,next_run,created)
                                         VALUES (?,?,?,?,unixepoch(),?)""", (*clean_form(form), now())).lastrowid
+                elif len(path) == 3 and path[0] == "domains" and path[2] == "duplicates":
+                    domain = unquote(path[1])
+                    db.execute("BEGIN IMMEDIATE")
+                    changes = duplicate_preview(db, domain)
+                    clean_duplicates(db, changes)
+                    location = domain_path(domain) + "/duplicates?" + urlencode(
+                        {"removed": sum(item[2] for item in changes)})
                 elif len(path) == 2 and path[0] == "domains":
                     domain = unquote(path[1])
                     jobs = domain_jobs(db).get(domain)
