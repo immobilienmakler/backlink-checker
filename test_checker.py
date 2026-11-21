@@ -95,6 +95,9 @@ class CheckerTests(unittest.TestCase):
             self.assertIn('/domains/andere.de', filtered)
             self.assertNotIn('/domains/ziel.de', filtered)
             self.assertIn("Keine Domain entspricht dem Filter.", request("GET", "/?status=lost"))
+            self.assertIn("Quelle", request("GET", "/runs/2/report"))
+            self.assertIn("\"status\": \"gefunden\"", request("GET", "/runs/2/json"))
+            self.assertIn("quelle;effektive_quelle", request("GET", "/runs/2/csv"))
             detail = request("GET", "/domains/ziel.de")
             self.assertIn('/jobs/2', detail)
             self.assertNotIn('/jobs/3', detail)
@@ -102,3 +105,48 @@ class CheckerTests(unittest.TestCase):
             self.assertIn("Location: /domains/ziel.de", request("POST", "/domains/ziel.de", {"csrf": app.TOKEN}))
             with app.connect() as db:
                 self.assertEqual(db.execute("SELECT id FROM jobs WHERE next_run IS NOT NULL").fetchall(), [(2,)])
+
+    def test_bulk_upload_and_resume(self):
+        from types import SimpleNamespace
+
+        count = 25_000
+        entries = [f"https://quelle-{i % 30}.example/{i}" for i in range(count)]
+        csv_data = "Referring Page URL;Titel\r\n" + "\r\n".join(
+            f'{source};"Eintrag; {i}"' for i, source in enumerate(entries)
+        ) + f"\r\n{entries[0]};Duplikat"
+        boundary = "backlinks-test"
+        body = (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="target"\r\n\r\nziel.de\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="source_file"; filename="links.csv"\r\n'
+            f'Content-Type: text/csv\r\n\r\n{csv_data}\r\n--{boundary}--\r\n'
+        ).encode("utf-8")
+        handler = SimpleNamespace(headers={"Content-Length": str(len(body)),
+                                           "Content-Type": f"multipart/form-data; boundary={boundary}"},
+                                  rfile=io.BytesIO(body))
+        job = app.clean_form(app.read_form(handler))
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, "DB", Path(directory) / "test.db"):
+            app.initialize()
+            with app.connect() as db:
+                db.execute("INSERT INTO jobs VALUES (1,?,?,?,?,NULL,'now')", job)
+                db.execute("INSERT INTO runs VALUES (1,1,'now',NULL)")
+                db.execute("INSERT INTO results VALUES (1,?,?,200,'fehlt','','[]')", (entries[0], entries[0]))
+            app.initialize()  # Simulate a container restart during the run.
+            def simulated(source, _target, _exact):
+                return source, 200, "fehlt", "", []
+
+            with patch.object(app, "inspect", new=simulated):
+                self.assertTrue(app.execute_next())
+            with app.connect() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*), COUNT(DISTINCT source) FROM results").fetchone(),
+                                 (count, count))
+                self.assertEqual(db.execute("SELECT id FROM runs WHERE finished IS NOT NULL").fetchall(), [(1,)])
+                self.assertEqual(app.domain_jobs(db)["ziel.de"][0].missing, count)
+
+    def test_file_and_text_deduplicate_and_enforce_limit(self):
+        import json
+        form = {"target": ["ziel.de"], "sources": ["https://quelle.example/"],
+                "source_file": ["URL,Title\nhttps://quelle.example/#fragment,Duplicate\nhttps://other.example/,Other"]}
+        self.assertEqual(json.loads(app.clean_form(form)[2]), ["https://quelle.example/", "https://other.example/"])
+        with patch.object(app, "MAX_SOURCES", 1), self.assertRaisesRegex(ValueError, "Maximal"):
+            app.clean_form(form)

@@ -2,7 +2,7 @@
 
 Selbst gehostete Web-App zur Prüfung und Überwachung bekannter Backlinks. Prüfe öffentliche Quellseiten gegen eine Domain einschließlich Subdomains oder gegen eine exakte Ziel-URL.
 
-- Bis zu 250 Quellseiten je Auftrag, eine URL pro Zeile. Bereits vorhandene Backlink-Listen lassen sich als URL-Spalte einfügen.
+- Bis zu 25.000 eindeutige Quellseiten je Auftrag per CSV-, TSV- oder Textimport. Quellen lassen sich auch direkt einfügen.
 - Einmalige und automatische Prüfungen im Stunden-, Tages- oder Wochenrhythmus.
 - HTTP-Status, Weiterleitungen, Ziel-URL, Ankertext und Linkattribute wie `nofollow`, `sponsored` und `ugc`.
 - Verlauf mit Markierung neu hinzugekommener und verlorener Backlinks beim Vergleich aufeinanderfolgender Prüfläufe. Abruffehler werden separat ausgewiesen.
@@ -54,7 +54,7 @@ ssh -L 8080:127.0.0.1:8080 user@docker-host
 
 Für einen Reverse Proxy verwende HTTPS und setze `APP_PASSWORD` auf ein langes Passwort. Bei der HTTP-Basic-Anmeldung ist der Benutzername frei wählbar. Compose unterstützt außerdem `WEB_PORT` und `BIND_IP`. Der Abruf externer Quellen erfolgt über öffentliche HTTP(S)-Adressen; private und reservierte IP-Adressen werden blockiert.
 
-Die Datenbank liegt unter `/data/backlinks.sqlite3`. Für eine einfache konsistente Volume-Sicherung stoppe den Container vor dem Kopieren. Unvollständige Prüfläufe werden beim nächsten Start neu eingeplant. Die Standardkonfiguration ist für eine App-Instanz pro Datenvolume gedacht.
+Die Datenbank liegt unter `/data/backlinks.sqlite3`. Für eine einfache konsistente Volume-Sicherung stoppe den Container vor dem Kopieren. Ein unterbrochener Prüflauf setzt beim nächsten Start bei den noch nicht gespeicherten Quellen fort. Die Standardkonfiguration ist für eine App-Instanz pro Datenvolume gedacht.
 
 ## Lokal testen
 
@@ -112,3 +112,12 @@ Beim Upgrade mit demselben Container-Volume erscheinen vorhandene Aufträge auto
 Das Dashboard zeigt die Zahl der Domains und Prüfaufträge, geprüfte Quellen mit gefundenen oder fehlenden Backlinks sowie Abruffehler. Die Domain-Tabelle enthält außerdem hinzugekommene und verlorene Links, den letzten abgeschlossenen Bericht und den nächsten Prüftermin. Du kannst nach Domain suchen oder gezielt fehlende, verlorene und nicht prüfbare Backlinks filtern.
 
 Der Vergleich verwendet pro Auftrag die letzten zwei abgeschlossenen Läufe. Eine Quelle zählt als hinzugekommen oder verloren, wenn sie zwischen **fehlt** und **gefunden** wechselt. Abruffehler bleiben separat sichtbar.
+
+### Große Quellenlisten prüfen
+
+1. Erstelle einen Auftrag für die Domain und lade deine Quellenliste hoch. Textdateien enthalten eine URL je Zeile. CSV und TSV brauchen eine Kopfzeile, etwa `Quell-URL`, `Source URL` oder `Referring Page URL`. Speichere die Datei als UTF-8. Komma, Semikolon und Tabulator werden unterstützt.
+2. Die App entfernt doppelte normalisierte URLs. Ein Auftrag unterstützt bis zu **25.000 eindeutige Quell-URLs**. Für größere Bestände kannst du mehrere Aufträge unter derselben Domain zusammenfassen. Die maximale Größe eines Uploads beträgt **16 MiB**. Bei einem Reverse Proxy muss dessen Upload-Limit ebenfalls ausreichen.
+3. Öffne den laufenden Bericht, um den Fortschritt zu sehen. Pro Auftrag werden bis zu 16 Quellen parallel geprüft, darunter höchstens zwei Start-URLs pro Quellhost gleichzeitig. Der Worker führt jeweils einen Auftrag aus. Die Laufzeit hängt vor allem von Antwortzeiten und der Verteilung der Quellen auf Hosts ab.
+4. Filtere die Ergebnisse nach Status oder blättere durch die Seiten mit je 100 Quellen. CSV und JSON enthalten alle bis zum Exportstart vorliegenden Ergebnisse des Laufs. Bei einem Neustart werden bereits gespeicherte Quellen desselben Laufs übersprungen.
+
+Die Kapazitätsgrenze zählt Quell-URLs. Die Anzahl der tatsächlich gefundenen Links kann davon abweichen. Wiederholungsintervalle werden jeweils ab dem Abschluss des letzten Laufs berechnet.

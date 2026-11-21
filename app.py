@@ -7,20 +7,30 @@ import os
 import secrets
 import sqlite3
 import threading
-from collections import namedtuple
+from time import monotonic
+from collections import defaultdict, deque, namedtuple
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import closing
 from datetime import datetime, timezone
+from email import policy
+from email.parser import BytesParser
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 from checker import inspect, normalize
 
 DB = Path(os.environ.get("DATA_DIR", "./data")) / "backlinks.sqlite3"
 PASSWORD = os.environ.get("APP_PASSWORD", "")
 TOKEN = secrets.token_urlsafe(32)
-MAX_SOURCES = 250
+MAX_SOURCES = 25_000
+MAX_IMPORT_BYTES = 16 * 1024 * 1024
+WORKERS = 16
+HOST_WORKERS = 2
+WRITE_BATCH = 25
+PAGE_SIZE = 100
+STATUSES = ("gefunden", "fehlt", "nicht prüfbar")
 
 
 def connect():
@@ -48,35 +58,74 @@ def initialize():
         CREATE INDEX IF NOT EXISTS result_run_source ON results(run_id,source);
         CREATE INDEX IF NOT EXISTS run_job ON runs(job_id);
         """)
-        db.execute("""UPDATE jobs SET next_run=unixepoch() WHERE id IN
-                   (SELECT job_id FROM runs WHERE finished IS NULL)""")
-        db.execute("DELETE FROM results WHERE run_id IN (SELECT id FROM runs WHERE finished IS NULL)")
-        db.execute("DELETE FROM runs WHERE finished IS NULL")
 
 
 def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def check_sources(sources, target, exact):
+    by_host = defaultdict(deque)
+    for source in sources:
+        by_host[urlsplit(source).hostname].append(source)
+    available = deque(by_host)
+    active = defaultdict(int)
+    pending = {}
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        while available or pending:
+            while available and len(pending) < WORKERS:
+                host = available.popleft()
+                source = by_host[host].popleft()
+                pending[pool.submit(inspect, source, target, exact)] = (host, source)
+                active[host] += 1
+                if by_host[host] and active[host] < HOST_WORKERS:
+                    available.append(host)
+            finished, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in finished:
+                host, source = pending.pop(future)
+                if by_host[host] and active[host] == HOST_WORKERS:
+                    available.append(host)
+                active[host] -= 1
+                yield source, future.result()
+
+
+def save_results(db, rows):
+    with db:
+        db.executemany("INSERT INTO results VALUES (?,?,?,?,?,?,?)", rows)
+    rows.clear()
+
+
 def execute_next():
-    with closing(connect()) as db, db:
-        db.execute("BEGIN IMMEDIATE")
-        job = db.execute("""SELECT id,target,exact,sources FROM jobs
-                            WHERE next_run <= unixepoch() ORDER BY next_run,id LIMIT 1""").fetchone()
-        if job is None:
-            return False
-        job_id, target, exact, sources = job
-        run_id = db.execute("INSERT INTO runs(job_id,started) VALUES (?,?)", (job_id, now())).lastrowid
-        db.execute("UPDATE jobs SET next_run=NULL WHERE id=?", (job_id,))
-    for source in json.loads(sources):
-        final, http, status, detail, links = inspect(source, target, exact)
-        with closing(connect()) as db, db:
-            db.execute("INSERT INTO results VALUES (?,?,?,?,?,?,?)",
-                       (run_id, source, final, http, status, detail, json.dumps(links, ensure_ascii=False)))
-    with closing(connect()) as db, db:
-        db.execute("UPDATE runs SET finished=? WHERE id=?", (now(), run_id))
-        db.execute("""UPDATE jobs SET next_run=COALESCE(next_run,unixepoch()+interval_hours*3600)
-                      WHERE id=? AND interval_hours>0""", (job_id,))
+    with closing(connect()) as db:
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            job = db.execute("""SELECT j.id,j.target,j.exact,j.sources,r.id
+                                FROM runs r JOIN jobs j ON j.id=r.job_id
+                                WHERE r.finished IS NULL ORDER BY r.id LIMIT 1""").fetchone()
+            if job is None:
+                job = db.execute("""SELECT id,target,exact,sources,NULL FROM jobs
+                                    WHERE next_run <= unixepoch() ORDER BY next_run,id LIMIT 1""").fetchone()
+            if job is None:
+                return False
+            job_id, target, exact, sources, run_id = job
+            if run_id is None:
+                run_id = db.execute("INSERT INTO runs(job_id,started) VALUES (?,?)", (job_id, now())).lastrowid
+                db.execute("UPDATE jobs SET next_run=NULL WHERE id=?", (job_id,))
+        done = {row[0] for row in db.execute("SELECT source FROM results WHERE run_id=?", (run_id,))}
+        batch = []
+        next_write = monotonic() + 2
+        for source, (final, http, status, detail, links) in check_sources(
+            (source for source in json.loads(sources) if source not in done), target, exact
+        ):
+            batch.append((run_id, source, final, http, status, detail, json.dumps(links, ensure_ascii=False)))
+            if len(batch) == WRITE_BATCH or monotonic() >= next_write:
+                save_results(db, batch)
+                next_write = monotonic() + 2
+        save_results(db, batch)
+        with db:
+            db.execute("UPDATE runs SET finished=? WHERE id=?", (now(), run_id))
+            db.execute("""UPDATE jobs SET next_run=COALESCE(next_run,unixepoch()+interval_hours*3600)
+                          WHERE id=? AND interval_hours>0""", (job_id,))
     return True
 
 
@@ -87,14 +136,73 @@ def worker():
             event.wait(2)
 
 
+SOURCE_HEADERS = {
+    "quelle", "quell-url", "quellseite", "source", "source url", "source_url",
+    "referring page", "referring page url", "referring url", "referring_url", "url",
+}
+
+
+def import_urls(raw):
+    raw = raw.lstrip("\ufeff")
+    if not raw.strip():
+        return
+    for delimiter in (";", ",", "\t"):
+        records = csv.reader(io.StringIO(raw, newline=""), delimiter=delimiter)
+        first = next((row for row in records if any(cell.strip() for cell in row)), [])
+        header = [cell.strip().casefold() for cell in first]
+        named = [index for index, name in enumerate(header) if name in SOURCE_HEADERS - {"url"}]
+        if named or "url" in header:
+            column = named[0] if named else header.index("url")
+            for row in records:
+                if any(cell.strip() for cell in row):
+                    yield records.line_num, row[column] if len(row) > column else ""
+            return
+    for number, line in enumerate(raw.splitlines(), 1):
+        if line.strip():
+            yield number, line
+
+
 def clean_form(form):
     target = normalize(form.get("target", [""])[0])
-    raw = form.get("sources", [""])[0]
-    sources = list(dict.fromkeys(normalize(line) for line in raw.splitlines() if line.strip()))
+    sources = {}
+    for name in ("sources", "source_file"):
+        raw = form.get(name, [""])[0]
+        for number, value in import_urls(raw):
+            try:
+                if not value.strip():
+                    raise ValueError("Quell-URL fehlt")
+                source = normalize(value)
+            except ValueError as exc:
+                raise ValueError(f'{("Datei" if name == "source_file" else "Liste")}, Zeile {number} · {exc}') from exc
+            sources[source] = None
+            if len(sources) > MAX_SOURCES:
+                raise ValueError("Maximal 25.000 eindeutige Quell-URLs pro Auftrag.")
     interval = int(form.get("interval", ["0"])[0])
-    if not 1 <= len(sources) <= MAX_SOURCES or interval not in {0, 1, 24, 168}:
-        raise ValueError("Bitte 1 bis 250 Quell-URLs und ein gültiges Prüfintervall angeben.")
-    return target, int(form.get("match") == ["exact"]), json.dumps(sources), interval
+    if not sources or interval not in {0, 1, 24, 168}:
+        raise ValueError("Bitte mindestens eine Quell-URL und ein gültiges Prüfintervall angeben.")
+    return target, int(form.get("match") == ["exact"]), json.dumps(list(sources)), interval
+
+
+def read_form(handler):
+    length = int(handler.headers.get("Content-Length", "0"))
+    if not 0 < length <= MAX_IMPORT_BYTES:
+        raise ValueError("Die Anfrage darf höchstens 16 MiB groß sein.")
+    body = handler.rfile.read(length)
+    if len(body) != length:
+        raise ValueError("Der Upload wurde unterbrochen.")
+    content_type = handler.headers.get("Content-Type", "")
+    if not content_type.startswith("multipart/form-data"):
+        return parse_qs(body.decode(), max_num_fields=12)
+    headers = ("Content-Type: " + content_type + "\r\n\r\n").encode("ascii")
+    message = BytesParser(policy=policy.default).parsebytes(headers + body)
+    if not message.is_multipart():
+        raise ValueError("Die Datei konnte nicht gelesen werden.")
+    form = {}
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition")
+        if name in {"csrf", "target", "sources", "source_file", "interval", "match"} and not part.is_multipart():
+            form[name] = [part.get_payload(decode=True).decode("utf-8-sig")]
+    return form
 
 
 def domain_key(target):
@@ -202,14 +310,16 @@ def create_form(target="", sources="", interval="0", exact=False):
         f'<option value="{hours}" {"selected" if str(hours) == interval else ""}>{label}</option>'
         for hours, label in [(0, "Einmalig"), (1, "Stündlich"), (24, "Täglich"), (168, "Wöchentlich")]
     )
-    return f"""<form method="post" action="/jobs">
+    return f"""<form method="post" action="/jobs" enctype="multipart/form-data">
     <input type="hidden" name="csrf" value="{TOKEN}">
     <label>Zieldomain oder Ziel-URL<input name="target" value="{escape(target)}" placeholder="https://beispiel.de" required></label>
     <div class="pair"><label>Abgleich<select name="match">
     <option value="domain">Domain inklusive Subdomains</option>
     <option value="exact" {"selected" if exact else ""}>Exakte Ziel-URL</option></select></label>
     <label>Wiederholung<select name="interval">{options}</select></label></div>
-    <label>Quellseiten<textarea name="sources" rows="6" placeholder="Eine URL pro Zeile" required>{escape(sources)}</textarea></label>
+    <label>Quellseiten<textarea name="sources" rows="6" placeholder="Eine URL pro Zeile">{escape(sources)}</textarea></label>
+    <label>CSV- oder Textdatei<input type="file" name="source_file" accept=".csv,.tsv,.txt,text/plain,text/csv"></label>
+    <small>Bis zu 25.000 eindeutige Quell-URLs pro Auftrag. CSV mit Kopfzeile, beispielsweise „Quell-URL“ oder „Source URL“.</small>
     <button>Prüfung starten</button></form>"""
 
 
@@ -383,50 +493,105 @@ class Handler(BaseHTTPRequestHandler):
         <input type="hidden" name="csrf" value="{TOKEN}">{controls}</form>
         <h2>Verlauf</h2><ul class="entries">{rows or "<li>Prüfung wartet auf Ausführung.</li>"}</ul>"""))
 
-    def run_report(self, run_id, mode):
-        with closing(connect()) as db:
-            run = db.execute("SELECT job_id, started, finished FROM runs WHERE id=?", (run_id,)).fetchone()
-            rows = db.execute("SELECT source,final,http,status,detail,links FROM results WHERE run_id=? ORDER BY rowid",
-                              (run_id,)).fetchall()
-        if not run or mode not in {"report", "csv", "json"}:
-            self.send_body(page("Prüflauf nicht gefunden", ""), 404)
-            return
+    def export_run(self, db, run_id, mode):
         fields = ("quelle", "effektive_quelle", "http_status", "status", "detail", "links")
-        if mode == "json":
-            payload = [dict(zip(fields, (*row[:-1], json.loads(row[-1])))) for row in rows]
-            self.send_body(json.dumps(payload, ensure_ascii=False, indent=2), mime="application/json; charset=utf-8",
-                           headers=[("Content-Disposition", f'attachment; filename="backlinks-{run_id}.json"')])
+        mime = "application/json" if mode == "json" else "text/csv"
+        self.send_response(200)
+        self.send_header("Content-Type", mime + "; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="backlinks-{run_id}.{mode}"')
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        rows = db.execute("SELECT source,final,http,status,detail,links FROM results WHERE run_id=? ORDER BY rowid",
+                          (run_id,))
+        write = self.wfile.write
+        try:
+            if mode == "json":
+                write(b"[")
+                for count, (*values, data) in enumerate(rows):
+                    payload = dict(zip(fields, (*values, json.loads(data))))
+                    write((("," if count else "") + json.dumps(payload, ensure_ascii=False)).encode())
+                write(b"]")
+            else:
+                buffer = io.StringIO()
+                writer = csv.writer(buffer, delimiter=";")
+                writer.writerow((*fields[:-1], "ziel", "ankertext", "rel"))
+                write(("\ufeff" + buffer.getvalue()).encode())
+                for *values, data in rows:
+                    buffer.seek(0)
+                    buffer.truncate()
+                    for link in json.loads(data) or [{"url": "", "anchor": "", "rel": ""}]:
+                        writer.writerow([safe_csv(value) for value in (*values, link["url"], link["anchor"], link["rel"])])
+                    write(buffer.getvalue().encode())
+        except (BrokenPipeError, ConnectionResetError):
             return
-        if mode == "csv":
-            buffer = io.StringIO()
-            writer = csv.writer(buffer, delimiter=";")
-            writer.writerow((*fields[:-1], "ziel", "ankertext", "rel"))
-            for *values, data in rows:
-                for link in json.loads(data) or [{"url": "", "anchor": "", "rel": ""}]:
-                    writer.writerow([safe_csv(value) for value in (*values, link["url"], link["anchor"], link["rel"])])
-            self.send_body("\ufeff" + buffer.getvalue(), mime="text/csv; charset=utf-8",
-                           headers=[("Content-Disposition", f'attachment; filename="backlinks-{run_id}.csv"')])
-            return
-        with closing(connect()) as db:
-            previous = dict(db.execute("""SELECT source,status FROM results WHERE run_id=(
-                SELECT MAX(id) FROM runs WHERE job_id=? AND id<? AND finished IS NOT NULL)""",
-                (run[0], run_id)))
+
+    def run_report(self, run_id, mode):
+        with closing(connect()) as db, db:
+            db.execute("BEGIN")
+            run = db.execute("""SELECT r.job_id,r.started,r.finished,json_array_length(j.sources)
+                              FROM runs r JOIN jobs j ON j.id=r.job_id WHERE r.id=?""", (run_id,)).fetchone()
+            if not run or mode not in {"report", "csv", "json"}:
+                self.send_body(page("Prüflauf nicht gefunden", ""), 404)
+                return
+            if mode in {"csv", "json"}:
+                self.export_run(db, run_id, mode)
+                return
+            try:
+                query = parse_qs(urlsplit(self.path).query, max_num_fields=6)
+            except ValueError:
+                query = {}
+            selection = query.get("status", [""])[0]
+            raw_page = query.get("page", ["1"])[0]
+            page_number = max(1, int(raw_page)) if raw_page.isascii() and raw_page.isdigit() and len(raw_page) <= 6 else 1
+            counts = dict(db.execute("SELECT status,COUNT(*) FROM results WHERE run_id=? GROUP BY status", (run_id,)))
+            processed = sum(counts.values())
+            if selection not in STATUSES:
+                selection = ""
+            matching = counts.get(selection, 0) if selection else processed
+            pages = max(1, (matching + PAGE_SIZE - 1) // PAGE_SIZE)
+            page_number = min(page_number, pages)
+            rows = db.execute("""SELECT s.source,s.final,s.http,s.status,s.detail,s.links,old.status
+                FROM results s LEFT JOIN results old ON old.source=s.source AND old.run_id=(
+                  SELECT MAX(id) FROM runs WHERE job_id=? AND id<? AND finished IS NOT NULL)
+                WHERE s.run_id=? AND (?='' OR s.status=?)
+                ORDER BY s.rowid LIMIT ? OFFSET ?""",
+                (run[0], run_id, run_id, selection, selection, PAGE_SIZE, (page_number - 1) * PAGE_SIZE)).fetchall()
         changes = {("fehlt", "gefunden"): "Hinzugekommen", ("gefunden", "fehlt"): "Verloren"}
-        counts = {key: sum(row[3] == key for row in rows) for key in ("gefunden", "fehlt", "nicht prüfbar")}
         table = []
-        for source, final, http, status, detail, data in rows:
+        for source, final, http, status, detail, data, previous in rows:
+            found = json.loads(data)
             links = "".join(f'<li>{escape(link["url"])}<br><small>{escape(link["anchor"] or "(ohne Text)")} · '
-                            f'{escape(link["rel"] or "ohne rel")}</small></li>' for link in json.loads(data))
+                            f'{escape(link["rel"] or "ohne rel")}</small></li>' for link in found[:10])
+            if len(found) > 10:
+                links += f"<li><small>{len(found) - 10} weitere Links im Export</small></li>"
             redirect = f'<small>Weiter zu {escape(final)}</small>' if source != final else ""
-            change = changes.get((previous.get(source), status), "")
+            change = changes.get((previous, status), "")
             table.append(f'<tr><td>{escape(source)}{redirect}</td>'
                          f'<td>{escape(status)} {http or ""}<small>{escape(detail or change)}</small></td><td><ul>{links}</ul></td></tr>')
-        summary = " · ".join(f"{value} {key}" for key, value in counts.items())
+        summary = " · ".join(f"{counts.get(key, 0)} {key}" for key in STATUSES)
+        def report_link(number, label):
+            query_string = escape(urlencode({"page": number, "status": selection}))
+            return f'<a href="?{query_string}">{label}</a>'
+        pagination = [f"Seite {page_number} von {pages}"]
+        if page_number > 1:
+            pagination.insert(0, report_link(page_number - 1, "Zurück"))
+        if page_number < pages:
+            pagination.append(report_link(page_number + 1, "Weiter"))
+        options = "".join(f'<option value="{escape(key)}" {"selected" if key == selection else ""}>{label}</option>'
+                          for key, label in [("", "Alle Ergebnisse"), *((key, key.capitalize()) for key in STATUSES)])
+        progress = f"{processed:,} von {max(run[3], processed):,} Quellen geprüft".replace(",", ".")
         self.send_body(page("Prüfergebnis", f"""<p><a href="/jobs/{run[0]}">Zum Prüfauftrag</a></p>
-        <p>{run[1]} · {"abgeschlossen" if run[2] else "läuft, Seite zum Aktualisieren neu laden"}</p>
-        <p>{summary}</p><p><a href="csv">CSV</a> · <a href="json">JSON</a></p>
+        <p>{run[1]} · {"abgeschlossen" if run[2] else "läuft"} · {progress}</p>
+        <p>{summary}</p><p><a href="csv">Alle als CSV</a> · <a href="json">Alle als JSON</a>
+        {' · ' + report_link(page_number, 'Aktualisieren') if not run[2] else ''}</p>
+        <form method="get" class="filters"><label>Status<select name="status">{options}</select></label><button>Filtern</button></form>
         <div class="scroll"><table><thead><tr><th>Quelle</th><th>Status</th><th>Gefundene Links</th></tr></thead>
-        <tbody>{"".join(table)}</tbody></table></div>"""))
+        <tbody>{"".join(table) or '<tr><td colspan="3">Keine Ergebnisse für diese Auswahl.</td></tr>'}</tbody></table></div>
+        <p aria-label="Seitennavigation">{" · ".join(pagination)}</p>"""))
 
     def do_POST(self):
         if not self.authorized():
@@ -434,11 +599,8 @@ class Handler(BaseHTTPRequestHandler):
         form = {}
         location = ""
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if not 0 < length <= 1_600_000:
-                raise ValueError("Ungültige Eingabegröße.")
-            form = parse_qs(self.rfile.read(length).decode(), max_num_fields=12)
-            if not hmac.compare_digest(form.get("csrf", [""])[0], TOKEN):
+            form = read_form(self)
+            if not hmac.compare_digest(form.get("csrf", [""])[0].encode(), TOKEN.encode()):
                 self.send_body(page("Ungültige Anfrage", '<a href="/">Zurück zur Übersicht</a>'), 403)
                 return
             path = urlsplit(self.path).path.strip("/").split("/")
@@ -466,9 +628,9 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self.send_body(page("Seite nicht gefunden", ""), 404)
                     return
-        except (ValueError, UnicodeError) as exc:
+        except (ValueError, csv.Error) as exc:
             self.send_body(page("Eingabe prüfen", f'<p role="alert">{escape(str(exc))}</p>' + create_form(
-                form.get("target", [""])[0], form.get("sources", [""])[0], form.get("interval", ["0"])[0],
+                form.get("target", [""])[0], form.get("sources", [""])[0][:50_000], form.get("interval", ["0"])[0],
                 form.get("match") == ["exact"])), 400)
             return
         self.send_body("", 303, headers=[("Location", location or f"/jobs/{job_id}")])
