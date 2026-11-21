@@ -117,7 +117,7 @@ Der Vergleich verwendet pro Auftrag die letzten zwei abgeschlossenen Läufe. Ein
 
 1. Erstelle einen Auftrag für die Domain und lade deine Quellenliste hoch. Textdateien enthalten eine URL je Zeile. CSV und TSV brauchen eine Kopfzeile, etwa `Quell-URL`, `Source URL` oder `Referring Page URL`. Speichere die Datei als UTF-8. Komma, Semikolon und Tabulator werden unterstützt.
 2. Die App entfernt doppelte normalisierte URLs. Ein Auftrag unterstützt bis zu **25.000 eindeutige Quell-URLs**. Für größere Bestände kannst du mehrere Aufträge unter derselben Domain zusammenfassen. Die maximale Größe eines Uploads beträgt **16 MiB**. Bei einem Reverse Proxy muss dessen Upload-Limit ebenfalls ausreichen.
-3. Öffne den laufenden Bericht, um den Fortschritt zu sehen. Pro Auftrag werden bis zu 16 Quellen parallel geprüft, darunter höchstens zwei Start-URLs pro Quellhost gleichzeitig. Der Worker führt jeweils einen Auftrag aus. Die Laufzeit hängt vor allem von Antwortzeiten und der Verteilung der Quellen auf Hosts ab.
+3. Öffne den laufenden Bericht, um den Fortschritt zu sehen. Pro Auftrag werden bis zu 16 Quellen parallel geprüft, darunter höchstens zwei Start-URLs pro Quellhost gleichzeitig. Der Worker wechselt nach jedem Arbeitsblock zwischen offenen Aufträgen. Die Laufzeit hängt vor allem von Antwortzeiten und der Verteilung der Quellen auf Hosts ab.
 4. Filtere die Ergebnisse nach Status oder blättere durch die Seiten mit je 100 Quellen. CSV und JSON enthalten alle bis zum Exportstart vorliegenden Ergebnisse des Laufs. Bei einem Neustart werden bereits gespeicherte Quellen desselben Laufs übersprungen.
 
 Die Kapazitätsgrenze zählt Quell-URLs. Die Anzahl der tatsächlich gefundenen Links kann davon abweichen. Wiederholungsintervalle werden jeweils ab dem Abschluss des letzten Laufs berechnet.
@@ -134,3 +134,9 @@ Die Kapazitätsgrenze zählt Quell-URLs. Die Anzahl der tatsächlich gefundenen 
 Öffne die Domain und klicke auf **Dubletten prüfen und bereinigen**. Die Vorschau zeigt je betroffenem Auftrag, wie viele Quell-URLs entfernt werden. Bereinigt werden identische Quell-URLs bei gleichem Domain-Abgleich oder gleicher exakter Ziel-URL. Ein abweichender Ziel-Hostname oder ein anderer Abgleich zählt als eigenständige Prüfung.
 
 Bei mehreren gleichwertigen Aufträgen bleibt die Quelle bevorzugt im Auftrag mit dem kürzesten automatischen Intervall. Bei gleichem Intervall hat der älteste Auftrag Vorrang. Aufträge ohne verbleibende Quellen pausieren. Bereits gespeicherte Berichte und laufende Prüfungen bleiben erhalten. Ergänze Quellen, um einen leeren Auftrag wieder zu aktivieren.
+
+### Große Prüfläufe steuern
+
+Im laufenden Bericht findest du eine Fortschrittsanzeige und die Schaltflächen **Prüfung pausieren** und **Prüfung fortsetzen**. Eine Pause greift nach dem aktuellen Arbeitsblock. Bereits angestoßene Abrufe dürfen fertig werden und werden gespeichert. Auch nach einem Container-Neustart bleibt ein pausierter Lauf pausiert.
+
+Der Worker wechselt zwischen offenen Aufträgen. Pro Arbeitsblock verarbeitet er bis zu 128 Quellen und startet nach etwa zehn Sekunden keine weiteren Abrufe für diesen Block. Angefangene Abrufe können länger dauern. Danach ist der nächste offene Auftrag an der Reihe. Dadurch können kleinere Prüfungen abschließen, während ein großer Auftrag noch läuft. Die Begrenzung auf 16 parallele Abrufe und zwei Start-URLs pro Quellhost gilt weiterhin.

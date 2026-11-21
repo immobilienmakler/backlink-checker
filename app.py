@@ -29,6 +29,8 @@ MAX_IMPORT_BYTES = 16 * 1024 * 1024
 WORKERS = 16
 HOST_WORKERS = 2
 WRITE_BATCH = 25
+SLICE_SIZE = 128
+SLICE_SECONDS = 10
 PAGE_SIZE = 100
 STATUSES = ("gefunden", "fehlt", "nicht prüfbar")
 
@@ -64,6 +66,11 @@ def initialize():
         CREATE TABLE IF NOT EXISTS retries (
           job_id INTEGER PRIMARY KEY, mode TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS run_controls (
+          run_id INTEGER PRIMARY KEY, paused INTEGER NOT NULL DEFAULT 0,
+          serving INTEGER NOT NULL DEFAULT 0, sequence INTEGER NOT NULL DEFAULT 0
+        );
+        UPDATE run_controls SET serving=0 WHERE serving<>0;
         INSERT OR IGNORE INTO run_plans
           SELECT r.id,j.sources,'full',0 FROM runs r JOIN jobs j ON j.id=r.job_id WHERE r.finished IS NULL;
         """)
@@ -73,7 +80,7 @@ def now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def check_sources(sources, target, exact):
+def check_sources(sources, target, exact, dispatch_until=None):
     by_host = defaultdict(deque)
     for source in sources:
         by_host[urlsplit(source).hostname].append(source)
@@ -82,13 +89,16 @@ def check_sources(sources, target, exact):
     pending = {}
     with ThreadPoolExecutor(max_workers=WORKERS) as pool:
         while available or pending:
-            while available and len(pending) < WORKERS:
+            while (available and len(pending) < WORKERS
+                   and (dispatch_until is None or monotonic() < dispatch_until)):
                 host = available.popleft()
                 source = by_host[host].popleft()
                 pending[pool.submit(inspect, source, target, exact)] = (host, source)
                 active[host] += 1
                 if by_host[host] and active[host] < HOST_WORKERS:
                     available.append(host)
+            if not pending:
+                break
             finished, _ = wait(pending, return_when=FIRST_COMPLETED)
             for future in finished:
                 host, source = pending.pop(future)
@@ -104,60 +114,86 @@ def save_results(db, rows):
     rows.clear()
 
 
-def execute_next():
+def prepare_due_run(db):
+    job = db.execute("""SELECT j.id,j.sources,COALESCE(q.mode,'full')
+                        FROM jobs j LEFT JOIN retries q ON q.job_id=j.id
+                        WHERE json_array_length(j.sources)>0
+                          AND (j.next_run <= unixepoch() OR q.job_id IS NOT NULL)
+                          AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.job_id=j.id AND r.finished IS NULL)
+                        ORDER BY CASE WHEN q.job_id IS NOT NULL THEN 0 ELSE 1 END,j.next_run,j.id LIMIT 1""").fetchone()
+    if job is None:
+        return False
+    job_id, sources, mode = job
+    inherited = 0
+    if mode != "full":
+        db.execute("DELETE FROM retries WHERE job_id=?", (job_id,))
+        inherited = inherited_sources(db, job_id, sources, mode)
+        if inherited == len(json.loads(sources)):
+            return True
+    run_id = db.execute("INSERT INTO runs(job_id,started) VALUES (?,?)", (job_id, now())).lastrowid
+    db.execute("INSERT INTO run_plans VALUES (?,?,?,?)", (run_id, sources, mode, inherited))
+    if inherited:
+        inherited_sources(db, job_id, sources, mode, run_id)
+    if mode == "full":
+        db.execute("UPDATE jobs SET next_run=NULL WHERE id=?", (job_id,))
+    return True
+
+
+def execute_next(slice_size=None, slice_seconds=None):
     with closing(connect()) as db:
         with db:
             db.execute("BEGIN IMMEDIATE")
-            job = db.execute("""SELECT j.id,j.target,j.exact,COALESCE(p.sources,j.sources),r.id,
-                                       COALESCE(p.mode,'full')
+            prepared = prepare_due_run(db)
+            job = db.execute("""SELECT j.id,j.target,j.exact,p.sources,r.id,p.mode
                                 FROM runs r JOIN jobs j ON j.id=r.job_id
-                                LEFT JOIN run_plans p ON p.run_id=r.id
-                                WHERE r.finished IS NULL ORDER BY r.id LIMIT 1""").fetchone()
+                                JOIN run_plans p ON p.run_id=r.id
+                                LEFT JOIN run_controls c ON c.run_id=r.id
+                                WHERE r.finished IS NULL AND COALESCE(c.paused,0)=0
+                                ORDER BY COALESCE(c.sequence,0),r.id LIMIT 1""").fetchone()
             if job is None:
-                job = db.execute("""SELECT j.id,j.target,j.exact,j.sources,NULL,COALESCE(q.mode,'full')
-                                    FROM jobs j LEFT JOIN retries q ON q.job_id=j.id
-                                    WHERE json_array_length(j.sources)>0
-                                      AND (j.next_run <= unixepoch() OR q.job_id IS NOT NULL)
-                                    ORDER BY CASE WHEN q.job_id IS NOT NULL THEN 0 ELSE 1 END,j.next_run,j.id LIMIT 1""").fetchone()
-            if job is None:
-                return False
+                return prepared
             job_id, target, exact, sources, run_id, mode = job
-            if run_id is None:
-                inherited = 0
-                if mode != "full":
-                    db.execute("DELETE FROM retries WHERE job_id=?", (job_id,))
-                    inherited = inherited_sources(db, job_id, sources, mode)
-                    if inherited == len(json.loads(sources)):
-                        return True
-                run_id = db.execute("INSERT INTO runs(job_id,started) VALUES (?,?)", (job_id, now())).lastrowid
-                db.execute("INSERT INTO run_plans VALUES (?,?,?,?)", (run_id, sources, mode, inherited))
-                if inherited:
-                    inherited_sources(db, job_id, sources, mode, run_id)
-                if mode == "full":
-                    db.execute("UPDATE jobs SET next_run=NULL WHERE id=?", (job_id,))
+            db.execute("""INSERT INTO run_controls (run_id,serving,sequence)
+                          SELECT ?,1,COALESCE(MAX(sequence),0)+1 FROM run_controls WHERE true
+                          ON CONFLICT(run_id) DO UPDATE SET serving=1,sequence=excluded.sequence""", (run_id,))
         done = {row[0] for row in db.execute("SELECT source FROM results WHERE run_id=?", (run_id,))}
+        waiting = [source for source in json.loads(sources) if source not in done]
+        selected = waiting[:slice_size]
         batch = []
+        completed = 0
         next_write = monotonic() + 2
-        for source, (final, http, status, detail, links) in check_sources(
-            (source for source in json.loads(sources) if source not in done), target, exact
-        ):
+        deadline = monotonic() + slice_seconds if slice_seconds is not None else None
+        for source, (final, http, status, detail, links) in check_sources(selected, target, exact, deadline):
+            completed += 1
             batch.append((run_id, source, final, http, status, detail, json.dumps(links, ensure_ascii=False)))
             if len(batch) == WRITE_BATCH or monotonic() >= next_write:
                 save_results(db, batch)
                 next_write = monotonic() + 2
         save_results(db, batch)
         with db:
-            db.execute("UPDATE runs SET finished=? WHERE id=?", (now(), run_id))
-            if mode == "full":
-                db.execute("""UPDATE jobs SET next_run=COALESCE(next_run,unixepoch()+interval_hours*3600)
-                              WHERE id=? AND interval_hours>0 AND json_array_length(sources)>0""", (job_id,))
+            if completed == len(waiting):
+                db.execute("UPDATE runs SET finished=? WHERE id=?", (now(), run_id))
+                db.execute("DELETE FROM run_controls WHERE run_id=?", (run_id,))
+                if mode == "full":
+                    db.execute("""UPDATE jobs SET next_run=COALESCE(next_run,unixepoch()+interval_hours*3600)
+                                  WHERE id=? AND interval_hours>0 AND json_array_length(sources)>0""", (job_id,))
+            else:
+                db.execute("UPDATE run_controls SET serving=0 WHERE run_id=?", (run_id,))
     return True
+
+
+def run_state(finished, paused, serving):
+    if finished:
+        return "Abgeschlossen"
+    if paused:
+        return "Pause angefordert" if serving else "Pausiert"
+    return "Läuft" if serving else "Wartet"
 
 
 def worker():
     event = threading.Event()
     while True:
-        if not execute_next():
+        if not execute_next(SLICE_SIZE, SLICE_SECONDS):
             event.wait(2)
 
 
@@ -243,7 +279,7 @@ def domain_path(domain):
     return "/domains/" + quote(domain, safe="")
 
 
-DomainJob = namedtuple("DomainJob", "id target exact interval scheduled run finished total found missing unavailable gained lost active")
+DomainJob = namedtuple("DomainJob", "id target exact interval scheduled run finished total found missing unavailable gained lost active paused serving")
 
 
 def domain_jobs(db):
@@ -255,6 +291,8 @@ def domain_jobs(db):
           SELECT l.job_id, MAX(p.id) AS previous FROM latest l
           JOIN runs p ON p.job_id=l.job_id AND p.id<l.run_id AND p.finished IS NOT NULL
           GROUP BY l.job_id
+        ), unfinished AS (
+          SELECT job_id,MAX(id) AS run_id FROM runs WHERE finished IS NULL GROUP BY job_id
         )
         SELECT j.id,j.target,j.exact,j.interval_hours,
           CASE WHEN q.job_id IS NOT NULL THEN unixepoch() ELSE j.next_run END,r.id,r.finished,
@@ -264,9 +302,10 @@ def domain_jobs(db):
           COUNT(CASE WHEN s.status='nicht prüfbar' THEN 1 END),
           COUNT(CASE WHEN s.status='gefunden' AND old.status='fehlt' THEN 1 END),
           COUNT(CASE WHEN s.status='fehlt' AND old.status='gefunden' THEN 1 END),
-          (SELECT MAX(id) FROM runs WHERE job_id=j.id AND finished IS NULL)
+          u.run_id,COALESCE(rc.paused,0),COALESCE(rc.serving,0)
         FROM jobs j LEFT JOIN latest l ON j.id=l.job_id LEFT JOIN retries q ON q.job_id=j.id
         LEFT JOIN comparison c ON c.job_id=j.id
+        LEFT JOIN unfinished u ON u.job_id=j.id LEFT JOIN run_controls rc ON rc.run_id=u.run_id
         LEFT JOIN runs r ON r.id=l.run_id LEFT JOIN results s ON s.run_id=r.id
         LEFT JOIN results old ON old.run_id=c.previous AND old.source=s.source
         GROUP BY j.id ORDER BY j.id DESC
@@ -283,12 +322,14 @@ def schedule_time(timestamp):
 
 def domain_summary(jobs, timestamp):
     latest = max((job for job in jobs if job.finished), key=lambda job: (job.finished, job.run), default=None)
-    scheduled = [job.scheduled for job in jobs if job.scheduled is not None]
+    scheduled = [job.scheduled for job in jobs if job.scheduled is not None and job.active is None]
     return {
         "latest": latest,
         "next": min(scheduled, default=None),
-        "running": sum(job.active is not None for job in jobs),
-        "queued": sum(value <= timestamp for value in scheduled),
+        "running": sum(job.serving for job in jobs),
+        "queued": sum(value <= timestamp for value in scheduled)
+                  + sum(job.active is not None and not job.paused and not job.serving for job in jobs),
+        "paused": sum(job.paused and not job.serving for job in jobs),
         "jobs": len(jobs),
         **{field: sum(getattr(job, field) for job in jobs)
            for field in ("total", "found", "missing", "unavailable", "gained", "lost")},
@@ -301,6 +342,8 @@ def dashboard_domain_row(domain, data):
     activity = []
     if data["running"]:
         activity.append(f'{data["running"]} aktiv')
+    if data["paused"]:
+        activity.append(f'{data["paused"]} pausiert')
     if data["queued"]:
         activity.append(f'{data["queued"]} in Warteschlange')
     if data["next"] is not None and not data["queued"]:
@@ -545,7 +588,7 @@ class Handler(BaseHTTPRequestHandler):
                                JOIN jobs j ON j.id=r.job_id WHERE r.finished IS NOT NULL
                                ORDER BY r.finished DESC,r.id DESC LIMIT 5""").fetchall()
         totals = {key: sum(data[key] for data in domains.values())
-                  for key in ("jobs", "total", "found", "missing", "unavailable", "gained", "lost", "running", "queued")}
+                  for key in ("jobs", "total", "found", "missing", "unavailable", "gained", "lost", "running", "queued", "paused")}
         metrics = (
             (str(len(domains)), "Domains", f'{totals["jobs"]} Prüfaufträge'),
             (str(totals["found"]), "Quellen mit Backlink", f'{totals["total"]} geprüfte Quellen'),
@@ -583,7 +626,7 @@ class Handler(BaseHTTPRequestHandler):
         <a class="primary-link" href="#neuer-auftrag">Neuer Prüfauftrag</a></div>
         <ul class="metrics">{cards}</ul>
         <section aria-labelledby="domains-title"><h2 id="domains-title">Domains</h2>
-        <p>{totals["running"]} aktive Prüfungen · {totals["queued"]} in Warteschlange</p>
+        <p>{totals["running"]} aktive Prüfungen · {totals["queued"]} in Warteschlange · {totals["paused"]} pausiert</p>
         <form method="get" action="/" class="filters">
         <label>Domain suchen<input type="search" name="q" value="{escape(search)}"></label>
         <label>Status<select name="status">{options}</select></label><button>Filtern</button></form>
@@ -602,10 +645,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         rows = []
         for job in jobs:
-            job_id, target, exact, interval, scheduled, run_id, finished, total, found, missing, unavailable, _, _, active = job
+            job_id, target, exact, interval, scheduled, run_id, finished, total, found, missing, unavailable, _, _, active, paused, serving = job
             schedule = f"Alle {interval} h" if interval else "Manuell"
             if active is not None:
-                schedule += f' · <a href="/runs/{active}/report">Läuft</a>'
+                schedule += f' · <a href="/runs/{active}/report">{run_state(None, paused, serving)}</a>'
             elif scheduled is not None:
                 schedule += " · nächste Prüfung " + schedule_time(scheduled)
             outcome = f'{found}/{total} gefunden · {missing} fehlen · {unavailable} nicht prüfbar'
@@ -647,9 +690,10 @@ class Handler(BaseHTTPRequestHandler):
             job = db.execute("""SELECT j.target,j.interval_hours,j.next_run,q.mode,json_array_length(j.sources)
                               FROM jobs j LEFT JOIN retries q ON q.job_id=j.id WHERE j.id=?""", (job_id,)).fetchone()
             runs = db.execute("""SELECT r.id,r.started,r.finished,
-                SUM(CASE WHEN s.status='gefunden' THEN 1 ELSE 0 END),COUNT(s.source),COALESCE(p.mode,'full')
+                SUM(CASE WHEN s.status='gefunden' THEN 1 ELSE 0 END),COUNT(s.source),COALESCE(p.mode,'full'),
+                COALESCE(c.paused,0),COALESCE(c.serving,0)
                 FROM runs r LEFT JOIN results s ON s.run_id=r.id
-                LEFT JOIN run_plans p ON p.run_id=r.id WHERE r.job_id=?
+                LEFT JOIN run_plans p ON p.run_id=r.id LEFT JOIN run_controls c ON c.run_id=r.id WHERE r.job_id=?
                 GROUP BY r.id ORDER BY r.id DESC""", (job_id,)).fetchall()
         if job is None:
             self.send_body(page("Prüfauftrag nicht gefunden", ""), 404)
@@ -660,9 +704,9 @@ class Handler(BaseHTTPRequestHandler):
         if job[1] and job[4]:
             controls += action("stop", "Automatik stoppen")
         rows = "".join(f'<li><a href="/runs/{i}/report">{started}</a>'
-                       f'<small>{found}/{total} gefunden · {"abgeschlossen" if finished else "läuft"}'
+                       f'<small>{found}/{total} gefunden · {run_state(finished, paused, serving)}'
                        f' · {"Vollprüfung" if mode == "full" else "Nachprüfung"}</small></li>'
-                       for i, started, finished, found, total, mode in runs)
+                       for i, started, finished, found, total, mode, paused, serving in runs)
         schedule = datetime.fromtimestamp(job[2], timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC") if job[2] else ""
         suffix = f" · Nächste Prüfung {schedule}" if schedule else ""
         self.send_body(page(job[0], f"""<p><a href="{domain_path(domain_key(job[0]))}">Zur Domain</a></p>
@@ -784,9 +828,11 @@ class Handler(BaseHTTPRequestHandler):
         with closing(connect()) as db, db:
             db.execute("BEGIN")
             run = db.execute("""SELECT r.job_id,r.started,r.finished,json_array_length(COALESCE(p.sources,j.sources)),
-                                       COALESCE(p.mode,'full'),COALESCE(p.inherited,0)
+                                       COALESCE(p.mode,'full'),COALESCE(p.inherited,0),
+                                       COALESCE(c.paused,0),COALESCE(c.serving,0)
                                 FROM runs r JOIN jobs j ON j.id=r.job_id
-                                LEFT JOIN run_plans p ON p.run_id=r.id WHERE r.id=?""", (run_id,)).fetchone()
+                                LEFT JOIN run_plans p ON p.run_id=r.id
+                                LEFT JOIN run_controls c ON c.run_id=r.id WHERE r.id=?""", (run_id,)).fetchone()
             if not run or mode not in {"report", "csv", "json", "changes"}:
                 self.send_body(page("Prüflauf nicht gefunden", ""), 404)
                 return
@@ -850,8 +896,16 @@ class Handler(BaseHTTPRequestHandler):
         inherited = f" · {run[5]} Ergebnisse aus dem vorherigen Lauf übernommen" if run[4] != "full" else ""
         change_export = escape(urlencode({"status": selection, "change": change_filter}))
 
+        controls = ""
+        if not run[2]:
+            action, label = ("resume", "Prüfung fortsetzen") if run[6] else ("pause", "Prüfung pausieren")
+            controls = f"""<p><progress aria-label="Prüffortschritt" value="{processed - run[5]}"
+            max="{max(1, run[3] - run[5])}"></progress></p>
+            <form class="actions" method="post" action="/runs/{run_id}/control">
+            <input type="hidden" name="csrf" value="{TOKEN}"><button name="action" value="{action}">{label}</button>
+            {'<small>Laufende Abrufe werden noch gespeichert.</small>' if run[6] and run[7] else ''}</form>"""
         self.send_body(page("Prüfergebnis", f"""<p><a href="/jobs/{run[0]}">Zum Prüfauftrag</a></p>
-        <p>{run[1]} · {"abgeschlossen" if run[2] else "läuft"} · {progress}{inherited}</p>
+        <p>{run[1]} · {run_state(run[2], run[6], run[7])} · {progress}{inherited}</p>{controls}
         <p>{summary}</p><p><a href="csv">Alle als CSV</a> · <a href="json">Alle als JSON</a>
         · <a href="changes?{change_export}">Änderungen als CSV</a>
         {' · ' + report_link(page_number, 'Aktualisieren') if not run[2] else ''}</p>
@@ -873,7 +927,18 @@ class Handler(BaseHTTPRequestHandler):
                 return
             path = urlsplit(self.path).path.strip("/").split("/")
             with closing(connect()) as db, db:
-                if path == ["jobs"]:
+                if (len(path) == 3 and path[0] == "runs" and path[2] == "control"
+                        and path[1].isascii() and path[1].isdigit() and len(path[1]) < 19):
+                    run_id = int(path[1])
+                    action = form.get("action", [""])[0]
+                    if action not in {"pause", "resume"}:
+                        raise ValueError("Unbekannte Aktion")
+                    db.execute("""INSERT INTO run_controls (run_id,paused)
+                                  SELECT id,? FROM runs WHERE id=? AND finished IS NULL
+                                  ON CONFLICT(run_id) DO UPDATE SET paused=excluded.paused""",
+                               (int(action == "pause"), run_id))
+                    location = f"/runs/{run_id}/report"
+                elif path == ["jobs"]:
                     job_id = db.execute("""INSERT INTO jobs(target,exact,sources,interval_hours,next_run,created)
                                         VALUES (?,?,?,?,unixepoch(),?)""", (*clean_form(form), now())).lastrowid
                 elif len(path) == 3 and path[0] == "domains" and path[2] == "duplicates":

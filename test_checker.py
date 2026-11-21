@@ -92,6 +92,12 @@ class CheckerTests(unittest.TestCase):
             dashboard = request("GET", "/")
             self.assertIn('/domains/andere.de', dashboard)
             self.assertIn('/runs/2/report', dashboard)
+            self.assertIn("Prüfung pausieren", request("GET", "/runs/3/report"))
+            self.assertIn("Location: /runs/3/report", request("POST", "/runs/3/control",
+                          {"action": "pause", "csrf": app.TOKEN}))
+            self.assertIn("Prüfung fortsetzen", request("GET", "/runs/3/report"))
+            self.assertIn("1 pausiert", request("GET", "/"))
+            request("POST", "/runs/3/control", {"action": "resume", "csrf": app.TOKEN})
             filtered = request("GET", "/?q=ANDERE&status=unverified")
             self.assertIn('/domains/andere.de', filtered)
             self.assertNotIn('/domains/ziel.de', filtered)
@@ -228,3 +234,33 @@ class CheckerTests(unittest.TestCase):
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM results").fetchone(), (1,))
                 app.queue_jobs(db, [1])
                 self.assertIsNone(db.execute("SELECT next_run FROM jobs WHERE id=1").fetchone()[0])
+
+    def test_worker_switches_between_jobs_and_leaves_paused_run_intact(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, "DB", Path(directory) / "test.db"):
+            app.initialize()
+            sources = [f"https://large.example/{i}" for i in range(5)]
+            with app.connect() as db:
+                db.executemany("INSERT INTO jobs VALUES (?,?,0,?,0,0,'now')", [
+                    (1, "https://gross.de/", json.dumps(sources)),
+                    (2, "https://klein.de/", json.dumps(["https://small.example/"])),
+                ])
+
+            def inspect(source, *_):
+                return source, 200, "fehlt", "", []
+
+            with patch.object(app, "inspect", new=inspect):
+                self.assertTrue(app.execute_next(2))
+                self.assertTrue(app.execute_next(2))
+                with app.connect() as db:
+                    self.assertEqual(db.execute("SELECT job_id FROM runs WHERE finished IS NOT NULL").fetchall(), [(2,)])
+                    db.execute("UPDATE run_controls SET paused=1 WHERE run_id=1")
+                app.initialize()
+                self.assertFalse(app.execute_next(2))
+                with app.connect() as db:
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM results WHERE run_id=1").fetchone()[0], 2)
+                    db.execute("UPDATE run_controls SET paused=0 WHERE run_id=1")
+                self.assertTrue(app.execute_next(2))
+                self.assertTrue(app.execute_next(2))
+            with app.connect() as db:
+                self.assertEqual(db.execute("SELECT COUNT(DISTINCT source) FROM results WHERE run_id=1").fetchone()[0], 5)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM runs WHERE finished IS NOT NULL").fetchone()[0], 2)
