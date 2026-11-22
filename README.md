@@ -151,3 +151,5 @@ IndexNow meldet kürzlich geänderte Seiten auf Hosts, deren Schlüsseldatei du 
 4. Der Checker prüft die HTTPS-Schlüsseldatei und sendet je Anfrage bis zu 10.000 URLs desselben Hosts. Akzeptierte Meldungen werden für diesen Prüflauf gespeichert. Der Dienst leitet Meldungen an teilnehmende Suchmaschinen weiter. Die Annahme ist keine Bestätigung einer Indexierung.
 
 [Offizielle IndexNow-Dokumentation](https://www.indexnow.org/documentation)
+
+**Quell-URL korrigieren:** Unter **Prüfauftrag → Quellen verwalten** neben dem Eintrag **Bearbeiten** wählen und die neue URL speichern. Die neue URL gilt für künftige Prüfungen. Doppelte URLs im selben Auftrag werden abgewiesen. Laufende Prüfungen und frühere Berichte behalten ihre ursprünglichen URLs.

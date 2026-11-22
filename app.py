@@ -387,7 +387,20 @@ def inherited_sources(db, job_id, sources, mode, run_id=None):
 
 
 def update_sources(db, job_id, current, form, action):
-    if action == "remove":
+    if action == "edit":
+        source = form.get("source", [""])[0]
+        if source not in current:
+            raise ValueError("Die ursprüngliche Quelle ist nicht mehr aktiv.")
+        replacement = normalize(form.get("replacement", [""])[0])
+        if replacement == source:
+            return "Die Quell-URL ist unverändert."
+        if replacement in current:
+            raise ValueError("Diese Quell-URL ist im Auftrag bereits vorhanden.")
+        updated = [replacement if entry == source else entry for entry in current]
+        db.execute("UPDATE retries SET mode=? WHERE job_id=? AND mode=?",
+                   ("source:" + replacement, job_id, "source:" + source))
+        note = "Quell-URL für künftige Prüfungen aktualisiert."
+    elif action == "remove":
         source = form.get("source", [""])[0]
         updated = [entry for entry in current if entry != source]
         if not updated:
@@ -821,7 +834,7 @@ class Handler(BaseHTTPRequestHandler):
         {action("attention", "Fehlende Quellen und Abruffehler")}</form>
         <h2>Verlauf</h2><ul class="entries">{rows or "<li>Prüfung wartet auf Ausführung.</li>"}</ul>"""))
 
-    def sources(self, job_id, query):
+    def sources(self, job_id, query, edit_error=None, replacement=None):
         with closing(connect()) as db:
             job = db.execute("SELECT target,sources FROM jobs WHERE id=?", (job_id,)).fetchone()
             shared = set()
@@ -846,11 +859,30 @@ class Handler(BaseHTTPRequestHandler):
         pages = max(1, (len(matching) + PAGE_SIZE - 1) // PAGE_SIZE)
         number = min(number, pages)
         feedback = params.get("updated", [""])[0][:160]
+        selected = params.get("edit", [""])[0]
+        edit_panel = ""
+        if selected in own:
+            proposed = selected if replacement is None else replacement
+            cancel = escape(urlencode({"q": search, "page": number}))
+            edit_panel = f"""<section id="bearbeiten">
+            <h2>Quell-URL bearbeiten</h2>
+            <form method="post" action="/jobs/{job_id}">
+            <input type="hidden" name="csrf" value="{TOKEN}">
+            <input type="hidden" name="source" value="{escape(selected)}">
+            <input type="hidden" name="q" value="{escape(search)}">
+            <input type="hidden" name="page" value="{number}">
+            <label>Neue Quell-URL<input name="replacement" value="{escape(proposed)}" maxlength="2048" required></label>
+            <small>Die neue URL gilt für künftige Prüfungen. Der bisherige Verlauf bleibt erhalten.</small>
+            <div class="actions"><button name="action" value="edit">Änderung speichern</button>
+            <a href="?{cancel}">Abbrechen</a></div></form></section>"""
+        elif selected and not edit_error:
+            edit_error = "Die ausgewählte Quelle ist nicht mehr aktiv."
         rows = "".join(f'<li>{escape(source)}'
                        f'{"<small>Auch in einem anderen Auftrag dieser Domain</small>" if source in shared else ""}'
                        f'<form class="inline" method="post" action="/jobs/{job_id}">'
                        f'<input type="hidden" name="csrf" value="{TOKEN}">'
                        f'<input type="hidden" name="source" value="{escape(source)}">'
+                       f'<a href="?{escape(urlencode({"edit": source, "q": search, "page": number}))}#bearbeiten">Bearbeiten</a> '
                        '<button name="action" value="retry-source">Nachprüfen</button> '
                        '<button name="action" value="remove">Für künftige Prüfungen entfernen</button></form></li>'
                        for source in matching[(number - 1) * PAGE_SIZE:number * PAGE_SIZE])
@@ -859,6 +891,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_body(page("Quellen verwalten", f"""
         <p><a href="/jobs/{job_id}">Zum Prüfauftrag</a> · {escape(job[0])} · {len(sources)} aktive Quellen</p>
         {f'<p role="status">{escape(feedback)}</p>' if feedback else ''}
+        {f'<p role="alert">{escape(edit_error)}</p>' if edit_error else ''}
+        {edit_panel}
         <h2>Quellen ergänzen</h2>
         <form method="post" action="/jobs/{job_id}" enctype="multipart/form-data">
         <input type="hidden" name="csrf" value="{TOKEN}">
@@ -870,7 +904,7 @@ class Handler(BaseHTTPRequestHandler):
         <form method="get" class="filters"><label>URL suchen<input name="q" type="search" value="{escape(search)}"></label>
         <button>Filtern</button></form>
         <ul class="entries source-list">{rows or '<li>Keine passenden Quellen.</li>'}</ul>
-        <p>Seite {number} von {pages}{links}</p>"""))
+        <p>Seite {number} von {pages}{links}</p>"""), 400 if edit_error else 200)
 
     def export_run(self, db, run_id, mode, filters):
         fields = ("quelle", "effektive_quelle", "http_status", "status", "detail", "links")
@@ -1064,9 +1098,12 @@ class Handler(BaseHTTPRequestHandler):
                     if job is None:
                         self.send_body(page("Prüfauftrag nicht gefunden", ""), 404)
                         return
-                    if action in {"append", "remove"}:
+                    if action in {"append", "remove", "edit"}:
                         feedback = update_sources(db, job_id, json.loads(job[0]), form, action)
-                        location = f"/jobs/{job_id}/sources?" + urlencode({"updated": feedback})
+                        query = {"updated": feedback}
+                        if action == "edit":
+                            query["q"] = normalize(form["replacement"][0])
+                        location = f"/jobs/{job_id}/sources?" + urlencode(query)
                     elif action in RETRY_MODES or action == "retry-source":
                         mode = action
                         if action == "retry-source":
@@ -1093,6 +1130,11 @@ class Handler(BaseHTTPRequestHandler):
                     return
         except (ValueError, csv.Error) as exc:
             if "job_id" in locals():
+                if form.get("action", [""])[0] == "edit":
+                    query = urlencode({key: form.get(field, [""])[0]
+                                       for key, field in (("edit", "source"), ("q", "q"), ("page", "page"))})
+                    self.sources(job_id, query, str(exc), form.get("replacement", [""])[0][:2048])
+                    return
                 back = f"/jobs/{job_id}" + ("/sources" if form.get("action", [""])[0] in {"append", "remove", "retry-source"} else "")
                 self.send_body(page("Eingabe prüfen", f'<p role="alert">{escape(str(exc))}</p><a href="{back}">Zurück</a>'), 400)
                 return

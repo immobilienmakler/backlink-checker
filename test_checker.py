@@ -110,6 +110,20 @@ class CheckerTests(unittest.TestCase):
             self.assertIn("Quellen verwalten", request("GET", "/jobs/2/sources"))
             response = request("POST", "/jobs/2", {"action": "append", "sources": "quelle.example", "csrf": app.TOKEN})
             self.assertIn("Location: /jobs/2/sources?updated=", response)
+            original = "https://quelle.example/"
+            edited = "https://neu.example/pfad"
+            edit_query = urlencode({"edit": original})
+            self.assertIn("Quell-URL bearbeiten", request("GET", f"/jobs/2/sources?{edit_query}"))
+            response = request("POST", "/jobs/2", {"action": "edit", "csrf": app.TOKEN,
+                                                   "source": original, "replacement": edited})
+            self.assertIn("303 See Other", response)
+            with app.connect() as db:
+                self.assertEqual(json.loads(db.execute("SELECT sources FROM jobs WHERE id=2").fetchone()[0]),
+                                 [edited])
+            self.assertIn(edited, request("GET", "/jobs/2/sources"))
+            stale = request("POST", "/jobs/2", {"action": "edit", "csrf": app.TOKEN,
+                                                "source": original, "replacement": edited})
+            self.assertIn("400 Bad Request", stale)
             detail = request("GET", "/domains/ziel.de")
             self.assertIn('/jobs/2', detail)
             self.assertNotIn('/jobs/3', detail)
